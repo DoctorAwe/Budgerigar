@@ -51,10 +51,10 @@ def main() -> None:
         "output_silence_rms": silence_energy / count,
         "output_speech_rms": speech_energy / count,
         "target_speech_rms": target_speech_energy / count,
+        "silence_to_speech_ratio": (silence_energy / count) / max(speech_energy / count, 1e-12),
         "chunk_max_error": chunk_error,
     }, indent=2))
 
 
 if __name__ == "__main__":
     main()
-

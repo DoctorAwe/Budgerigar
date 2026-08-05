@@ -79,18 +79,23 @@ class CausalConv1d(nn.Module):
 class WaveformDecoder(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        self.net = nn.Sequential(
+        self.backbone = nn.Sequential(
             nn.ConvTranspose1d(dim, 128, kernel_size=5, stride=5), nn.LeakyReLU(0.1),
             CausalConv1d(128, 128, 1), nn.LeakyReLU(0.1),
             nn.ConvTranspose1d(128, 64, kernel_size=4, stride=4), nn.LeakyReLU(0.1),
             CausalConv1d(64, 64, 1), nn.LeakyReLU(0.1),
             nn.ConvTranspose1d(64, 32, kernel_size=8, stride=8), nn.LeakyReLU(0.1),
             CausalConv1d(32, 32, 1), nn.LeakyReLU(0.1),
-            CausalConv1d(32, 1, 1), nn.Tanh(),
         )
+        self.waveform_head = CausalConv1d(32, 1, 1)
+        self.envelope_head = CausalConv1d(32, 1, 1)
+        nn.init.constant_(self.envelope_head.conv.bias, -2.0)
 
     def forward(self, latent: Tensor) -> Tensor:
-        return self.net(latent.transpose(1, 2))[:, 0]
+        features = self.backbone(latent.transpose(1, 2))
+        waveform = torch.tanh(self.waveform_head(features))
+        envelope = torch.sigmoid(self.envelope_head(features))
+        return (waveform * envelope)[:, 0]
 
 
 class StreamingWaveformProcessor(nn.Module):

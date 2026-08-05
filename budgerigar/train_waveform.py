@@ -32,13 +32,19 @@ def multi_resolution_stft_loss(prediction: torch.Tensor, target: torch.Tensor) -
 
 
 def waveform_losses(prediction, target, speech_mask, hop_samples):
-    weights = torch.where(speech_mask, 4.0, 1.0).to(prediction.dtype)
-    waveform = ((prediction - target).abs() * weights).sum() / weights.sum().clamp_min(1)
+    speech = speech_mask
+    silence = ~speech_mask
+    speech_waveform = (prediction[speech] - target[speech]).abs().mean()
+    silence_rms = prediction[silence].float().square().mean().sqrt()
     predicted_energy = F.avg_pool1d(prediction.abs().unsqueeze(1), hop_samples, hop_samples)[:, 0]
     target_energy = F.avg_pool1d(target.abs().unsqueeze(1), hop_samples, hop_samples)[:, 0]
     envelope = F.l1_loss(predicted_energy, target_energy)
-    spectral = multi_resolution_stft_loss(prediction.float(), target.float())
-    return waveform + spectral + 0.5 * envelope, waveform, spectral, envelope
+    speech_float = speech_mask.to(prediction.dtype)
+    spectral = multi_resolution_stft_loss(
+        (prediction * speech_float).float(), (target * speech_float).float(),
+    )
+    loss = 2.0 * speech_waveform + spectral + 5.0 * silence_rms + 3.0 * envelope
+    return loss, speech_waveform, spectral, envelope, silence_rms
 
 
 def main() -> None:
@@ -95,7 +101,7 @@ def main() -> None:
                     )
                     pieces.append(output)
                 prediction = torch.cat(pieces, dim=1)
-                loss, waveform_loss, spectral_loss, envelope_loss = waveform_losses(
+                loss, waveform_loss, spectral_loss, envelope_loss, silence_loss = waveform_losses(
                     prediction, target, speech_mask, config.hop_samples,
                 )
                 scaled_loss = loss / args.gradient_accumulation
@@ -114,6 +120,7 @@ def main() -> None:
                 print(
                     f"step={step} loss={loss.item():.4f} wave={waveform_loss.item():.4f} "
                     f"stft={spectral_loss.item():.4f} envelope={envelope_loss.item():.4f} "
+                    f"silence_rms={silence_loss.item():.4f} "
                     f"speed={20 / elapsed:.2f} steps/s"
                 )
                 started = time.perf_counter()
@@ -130,4 +137,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
