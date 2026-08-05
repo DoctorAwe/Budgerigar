@@ -33,6 +33,8 @@ Colab 连续神经复读基线：[notebooks/Budgerigar_Neural_Echo_Train.ipynb](
 
 Colab 时间轴行为评估：[notebooks/Budgerigar_Neural_Echo_Evaluate.ipynb](notebooks/Budgerigar_Neural_Echo_Evaluate.ipynb)。在扩大训练前检查提前发声、思考间隔、复读召回和全静默退化。
 
+Colab 内容保持评估：[notebooks/Budgerigar_Neural_Echo_Content_Evaluate.ipynb](notebooks/Budgerigar_Neural_Echo_Content_Evaluate.ipynb)。通过正确/打乱目标检索与输入消融，检查神经记忆是否真正保留当前句子。
+
 ## 文档导航
 
 1. [阶段 0：问题定义与验收标准](docs/01_阶段0_问题定义.md)
