@@ -45,7 +45,10 @@ def greedy_decode(logits, lengths, blank=0):
     return sequences
 
 
-def train_content_memory(feature_manifest, stats, output_dir, training=ContentTrainingConfig(), model_config=None):
+def train_content_memory(
+    feature_manifest, stats, output_dir, training=ContentTrainingConfig(),
+    model_config=None, resume_from=None,
+):
     torch, _, functional = require_torch(); torch.manual_seed(training.seed)
     vocabulary = CharacterVocabulary()
     model_config = model_config or ContentMemoryConfig(vocabulary_size=len(vocabulary.symbols))
@@ -59,7 +62,21 @@ def train_content_memory(feature_manifest, stats, output_dir, training=ContentTr
     model = create_content_memory(model_config).to(device); optimizer = torch.optim.AdamW(model.parameters(), lr=training.learning_rate, weight_decay=1e-4)
     ctc_loss = torch.nn.CTCLoss(blank=0, zero_infinity=True); output_dir = Path(output_dir); output_dir.mkdir(parents=True, exist_ok=True)
     history = []; best_cer = float("inf"); step = 0
-    for epoch in range(training.epochs):
+    if resume_from is not None and Path(resume_from).is_file():
+        resume = torch.load(resume_from, map_location="cpu", weights_only=True)
+        if resume.get("architecture") != "content_token_memory":
+            raise ValueError("resume checkpoint is not a content_token_memory model")
+        if resume["model_config"] != asdict(model_config):
+            raise ValueError("resume model configuration does not match the current configuration")
+        model.load_state_dict(resume["model"]); optimizer.load_state_dict(resume["optimizer"])
+        for state in optimizer.state.values():
+            for key, value in state.items():
+                if torch.is_tensor(value): state[key] = value.to(device)
+        history = list(resume.get("history", []))
+        step = int(history[-1]["step"]) if history else 0
+        best_cer = min((row["validation_cer"] for row in history), default=float("inf"))
+        print(f"[resume] {resume_from} step={step} best_cer={best_cer:.4f}", flush=True)
+    for epoch in range(len(history), training.epochs):
         model.train(); total = count = 0
         for inputs, frame_lengths, texts, text_lengths, _, _ in train_loader:
             inputs, frame_lengths, texts, text_lengths = inputs.to(device), frame_lengths.to(device), texts.to(device), text_lengths.to(device)
@@ -95,8 +112,8 @@ def train_content_memory(feature_manifest, stats, output_dir, training=ContentTr
 
 
 def main():
-    parser = argparse.ArgumentParser(); parser.add_argument("feature_manifest", type=Path); parser.add_argument("stats", type=Path); parser.add_argument("output_dir", type=Path)
-    args = parser.parse_args(); torch, _, _ = require_torch(); train_content_memory(args.feature_manifest, torch.load(args.stats, map_location="cpu", weights_only=True), args.output_dir); return 0
+    parser = argparse.ArgumentParser(); parser.add_argument("feature_manifest", type=Path); parser.add_argument("stats", type=Path); parser.add_argument("output_dir", type=Path); parser.add_argument("--resume", type=Path)
+    args = parser.parse_args(); torch, _, _ = require_torch(); train_content_memory(args.feature_manifest, torch.load(args.stats, map_location="cpu", weights_only=True), args.output_dir, resume_from=args.resume); return 0
 
 
 if __name__ == "__main__": raise SystemExit(main())
