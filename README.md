@@ -41,6 +41,8 @@ Colab 层级模型联合评估：[notebooks/Budgerigar_Hierarchical_Echo_Evaluat
 
 Colab 内容记忆预训练：[notebooks/Budgerigar_Content_Memory_Train.ipynb](notebooks/Budgerigar_Content_Memory_Train.ipynb)。在重新训练声学复读前，用 transcript CTC 与音频—文本 InfoNCE 强制 token bank 保存可恢复语言内容。
 
+Colab 顺序敏感内容迁移训练：[notebooks/Budgerigar_Content_Memory_Sequence_Train.ipynb](notebooks/Budgerigar_Content_Memory_Sequence_Train.ipynb)。迁移已学 token bank/CTC，使用双向 GRU 音频与文字序列头替换无序平均池化检索。
+
 ## 文档导航
 
 1. [阶段 0：问题定义与验收标准](docs/01_阶段0_问题定义.md)

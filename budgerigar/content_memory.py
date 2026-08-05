@@ -14,6 +14,8 @@ class ContentMemoryConfig:
     update_stride: int = 4
     vocabulary_size: int = 32
     contrastive_dim: int = 128
+    sequence_contrastive: bool = False
+    sequence_layers: int = 1
 
 
 def create_content_memory(config: ContentMemoryConfig):
@@ -32,9 +34,21 @@ def create_content_memory(config: ContentMemoryConfig):
             self.optimizer = nn.GRUCell(dim, dim)
             self.write_gate = nn.Sequential(nn.Linear(dim * 3 + 1, dim), nn.SiLU(), nn.Linear(dim, 1))
             self.ctc_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, config.vocabulary_size))
-            self.audio_projection = nn.Linear(dim, config.contrastive_dim)
+            if config.sequence_contrastive:
+                self.audio_sequence = nn.GRU(
+                    dim, dim, config.sequence_layers, batch_first=True, bidirectional=True,
+                )
+                self.text_sequence = nn.GRU(
+                    dim, dim, config.sequence_layers, batch_first=True, bidirectional=True,
+                )
+                projection_input = dim * 2
+            else:
+                self.audio_sequence = None
+                self.text_sequence = None
+                projection_input = dim
+            self.audio_projection = nn.Linear(projection_input, config.contrastive_dim)
             self.text_embedding = nn.Embedding(config.vocabulary_size, dim, padding_idx=0)
-            self.text_projection = nn.Linear(dim, config.contrastive_dim)
+            self.text_projection = nn.Linear(projection_input, config.contrastive_dim)
             self.log_temperature = nn.Parameter(torch.tensor(math.log(1 / 0.07)))
 
         def _update(self, encoded, vad, tokens, active):
@@ -70,12 +84,27 @@ def create_content_memory(config: ContentMemoryConfig):
             logits = self.ctc_head(ordered)
             positions = torch.arange(config.token_slots, device=inputs.device).unsqueeze(0)
             valid = positions < memory_lengths.unsqueeze(1)
-            audio_pool = (ordered * valid.unsqueeze(-1)).sum(1) / memory_lengths.clamp_min(1).unsqueeze(1)
+            if config.sequence_contrastive:
+                packed_audio = nn.utils.rnn.pack_padded_sequence(
+                    ordered, memory_lengths.cpu(), batch_first=True, enforce_sorted=False,
+                )
+                _, audio_hidden = self.audio_sequence(packed_audio)
+                audio_pool = torch.cat([audio_hidden[-2], audio_hidden[-1]], dim=-1)
+            else:
+                audio_pool = (ordered * valid.unsqueeze(-1)).sum(1) / memory_lengths.clamp_min(1).unsqueeze(1)
             audio_embedding = functional.normalize(self.audio_projection(audio_pool), dim=-1)
             text_embedding = None
             if text_tokens is not None:
                 text_valid = torch.arange(text_tokens.shape[1], device=inputs.device).unsqueeze(0) < text_lengths.unsqueeze(1)
-                text_pool = (self.text_embedding(text_tokens) * text_valid.unsqueeze(-1)).sum(1) / text_lengths.clamp_min(1).unsqueeze(1)
+                embedded_text = self.text_embedding(text_tokens)
+                if config.sequence_contrastive:
+                    packed_text = nn.utils.rnn.pack_padded_sequence(
+                        embedded_text, text_lengths.cpu(), batch_first=True, enforce_sorted=False,
+                    )
+                    _, text_hidden = self.text_sequence(packed_text)
+                    text_pool = torch.cat([text_hidden[-2], text_hidden[-1]], dim=-1)
+                else:
+                    text_pool = (embedded_text * text_valid.unsqueeze(-1)).sum(1) / text_lengths.clamp_min(1).unsqueeze(1)
                 text_embedding = functional.normalize(self.text_projection(text_pool), dim=-1)
             diagnostics = {"write_strength": torch.stack(write_history, 1)}
             return logits, memory_lengths, audio_embedding, text_embedding, diagnostics
@@ -83,4 +112,3 @@ def create_content_memory(config: ContentMemoryConfig):
         def export_config(self): return asdict(config)
 
     return ContentMemory()
-

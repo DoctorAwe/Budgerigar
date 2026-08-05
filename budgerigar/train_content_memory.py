@@ -22,6 +22,7 @@ class ContentTrainingConfig:
     contrastive_weight: float = 0.25
     gradient_clip: float = 1.0
     seed: int = 31
+    initialization_checkpoint: str | None = None
 
 
 def _edit_distance(reference, hypothesis):
@@ -59,14 +60,29 @@ def train_content_memory(
     train_loader = loader(train_set, batch_size=training.batch_size, shuffle=True, num_workers=0, collate_fn=collate_content)
     validation_loader = loader(validation_set, batch_size=training.batch_size, shuffle=False, num_workers=0, collate_fn=collate_content)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = create_content_memory(model_config).to(device); optimizer = torch.optim.AdamW(model.parameters(), lr=training.learning_rate, weight_decay=1e-4)
+    model = create_content_memory(model_config).to(device)
+    if resume_from is None and training.initialization_checkpoint:
+        initialization = torch.load(training.initialization_checkpoint, map_location="cpu", weights_only=True)
+        current = model.state_dict(); transferred = {}
+        for key, value in initialization["model"].items():
+            if key in current and current[key].shape == value.shape:
+                transferred[key] = value
+        missing, unexpected = model.load_state_dict(transferred, strict=False)
+        print(
+            f"[transfer] source={training.initialization_checkpoint} tensors={len(transferred)} "
+            f"new_or_changed={len(missing)} unexpected={len(unexpected)}",
+            flush=True,
+        )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=training.learning_rate, weight_decay=1e-4)
     ctc_loss = torch.nn.CTCLoss(blank=0, zero_infinity=True); output_dir = Path(output_dir); output_dir.mkdir(parents=True, exist_ok=True)
-    history = []; best_cer = float("inf"); step = 0
+    history = []; best_cer = float("inf"); best_score = float("inf"); step = 0
     if resume_from is not None and Path(resume_from).is_file():
         resume = torch.load(resume_from, map_location="cpu", weights_only=True)
-        if resume.get("architecture") != "content_token_memory":
-            raise ValueError("resume checkpoint is not a content_token_memory model")
-        if resume["model_config"] != asdict(model_config):
+        expected_architecture = "content_token_memory_sequence" if model_config.sequence_contrastive else "content_token_memory"
+        if resume.get("architecture") != expected_architecture:
+            raise ValueError(f"resume checkpoint is not a {expected_architecture} model")
+        normalized_resume_config = asdict(ContentMemoryConfig(**resume["model_config"]))
+        if normalized_resume_config != asdict(model_config):
             raise ValueError("resume model configuration does not match the current configuration")
         model.load_state_dict(resume["model"]); optimizer.load_state_dict(resume["optimizer"])
         for state in optimizer.state.values():
@@ -75,6 +91,7 @@ def train_content_memory(
         history = list(resume.get("history", []))
         step = int(history[-1]["step"]) if history else 0
         best_cer = min((row["validation_cer"] for row in history), default=float("inf"))
+        best_score = min((row.get("selection_score", row["validation_cer"]) for row in history), default=float("inf"))
         print(f"[resume] {resume_from} step={step} best_cer={best_cer:.4f}", flush=True)
     for epoch in range(len(history), training.epochs):
         model.train(); total = count = 0
@@ -101,13 +118,18 @@ def train_content_memory(
                 for index, hypothesis in enumerate(decoded):
                     reference = texts[index, :text_lengths[index]].cpu().tolist(); edits += _edit_distance(reference, hypothesis); characters += len(reference)
                 retrieval_hits += int((audio_embedding @ text_embedding.T).argmax(1).eq(torch.arange(len(inputs), device=device)).sum()); samples += len(inputs)
-        metrics = {"epoch": epoch + 1, "step": step, "train_loss": total / count, "validation_ctc": validation_ctc / batches, "validation_cer": edits / max(characters, 1), "validation_retrieval_top1": retrieval_hits / samples}
+        validation_cer = edits / max(characters, 1); validation_retrieval = retrieval_hits / samples
+        metrics = {"epoch": epoch + 1, "step": step, "train_loss": total / count, "validation_ctc": validation_ctc / batches, "validation_cer": validation_cer, "validation_retrieval_top1": validation_retrieval, "selection_score": validation_cer - 0.5 * validation_retrieval}
         history.append(metrics); print(json.dumps(metrics), flush=True)
-        checkpoint = {"architecture": "content_token_memory", "model": model.state_dict(), "optimizer": optimizer.state_dict(), "stats": stats, "model_config": asdict(model_config), "training_config": asdict(training), "vocabulary": vocabulary.symbols, "history": history}
+        architecture = "content_token_memory_sequence" if model_config.sequence_contrastive else "content_token_memory"
+        checkpoint = {"architecture": architecture, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "stats": stats, "model_config": asdict(model_config), "training_config": asdict(training), "vocabulary": vocabulary.symbols, "history": history}
         torch.save(checkpoint, output_dir / "last.pt")
-        if metrics["validation_cer"] < best_cer: best_cer = metrics["validation_cer"]; torch.save(checkpoint, output_dir / "best.pt")
+        best_cer = min(best_cer, metrics["validation_cer"])
+        if metrics["selection_score"] < best_score:
+            best_score = metrics["selection_score"]; torch.save(checkpoint, output_dir / "best.pt")
         if step >= training.max_steps: break
-    report = {"architecture": "content_token_memory", "steps": step, "best_validation_cer": best_cer, "history": history}
+    architecture = "content_token_memory_sequence" if model_config.sequence_contrastive else "content_token_memory"
+    report = {"architecture": architecture, "steps": step, "best_validation_cer": best_cer, "best_selection_score": best_score, "history": history}
     (output_dir / "training_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"); return report
 
 
