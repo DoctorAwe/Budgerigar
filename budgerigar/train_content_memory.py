@@ -10,15 +10,21 @@ from .content_memory import ContentMemoryConfig, create_content_memory
 from .neural_echo import require_torch
 
 
+def _architecture(config):
+    if config.acoustic_ctc: return "content_local_dual_ctc_memory"
+    return "content_token_memory_sequence" if config.sequence_contrastive else "content_token_memory"
+
+
 @dataclass(frozen=True)
 class ContentTrainingConfig:
     batch_size: int = 4
     learning_rate: float = 3e-4
     epochs: int = 30
     max_steps: int = 300
-    max_train_records: int = 256
-    max_validation_records: int = 64
+    max_train_records: int | None = 256
+    max_validation_records: int | None = 64
     ctc_weight: float = 1.0
+    acoustic_ctc_weight: float = 0.0
     contrastive_weight: float = 0.25
     gradient_clip: float = 1.0
     seed: int = 31
@@ -78,7 +84,7 @@ def train_content_memory(
     history = []; best_cer = float("inf"); best_score = float("inf"); step = 0
     if resume_from is not None and Path(resume_from).is_file():
         resume = torch.load(resume_from, map_location="cpu", weights_only=True)
-        expected_architecture = "content_token_memory_sequence" if model_config.sequence_contrastive else "content_token_memory"
+        expected_architecture = _architecture(model_config)
         if resume.get("architecture") != expected_architecture:
             raise ValueError(f"resume checkpoint is not a {expected_architecture} model")
         normalized_resume_config = asdict(ContentMemoryConfig(**resume["model_config"]))
@@ -99,38 +105,47 @@ def train_content_memory(
         model.train(); total = count = 0
         for inputs, frame_lengths, texts, text_lengths, _, _ in train_loader:
             inputs, frame_lengths, texts, text_lengths = inputs.to(device), frame_lengths.to(device), texts.to(device), text_lengths.to(device)
-            logits, memory_lengths, audio_embedding, text_embedding, _ = model(inputs, frame_lengths, texts, text_lengths)
+            logits, memory_lengths, audio_embedding, text_embedding, diagnostics = model(inputs, frame_lengths, texts, text_lengths)
             ctc = ctc_loss(logits.log_softmax(-1).transpose(0, 1), texts, memory_lengths, text_lengths)
+            acoustic_logits = diagnostics["acoustic_logits"]
+            acoustic_ctc = (
+                ctc_loss(acoustic_logits.log_softmax(-1).transpose(0, 1), texts, diagnostics["acoustic_lengths"], text_lengths)
+                if acoustic_logits is not None else ctc.new_zeros(())
+            )
             scale = model.log_temperature.exp().clamp(max=100)
             similarities = scale * audio_embedding @ text_embedding.T
             labels = torch.arange(len(inputs), device=device)
             contrastive = (functional.cross_entropy(similarities, labels) + functional.cross_entropy(similarities.T, labels)) / 2
-            loss = training.ctc_weight * ctc + training.contrastive_weight * contrastive
+            loss = training.ctc_weight * ctc + training.acoustic_ctc_weight * acoustic_ctc + training.contrastive_weight * contrastive
             optimizer.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), training.gradient_clip); optimizer.step()
             step += 1; total += float(loss); count += 1
-            if step == 1 or step % 10 == 0: print(f"[content train] step={step} loss={float(loss):.4f} ctc={float(ctc):.4f} nce={float(contrastive):.4f}", flush=True)
+            if step == 1 or step % 10 == 0: print(f"[content train] step={step} loss={float(loss):.4f} bank_ctc={float(ctc):.4f} acoustic_ctc={float(acoustic_ctc):.4f} nce={float(contrastive):.4f}", flush=True)
             if step >= training.max_steps: break
-        model.eval(); edits = characters = retrieval_hits = samples = 0; validation_ctc = 0; batches = 0
+        model.eval(); edits = acoustic_edits = characters = retrieval_hits = samples = 0; validation_ctc = validation_acoustic_ctc = 0; batches = 0
         with torch.no_grad():
             for inputs, frame_lengths, texts, text_lengths, _, _ in validation_loader:
                 inputs, frame_lengths, texts, text_lengths = inputs.to(device), frame_lengths.to(device), texts.to(device), text_lengths.to(device)
-                logits, memory_lengths, audio_embedding, text_embedding, _ = model(inputs, frame_lengths, texts, text_lengths)
+                logits, memory_lengths, audio_embedding, text_embedding, diagnostics = model(inputs, frame_lengths, texts, text_lengths)
                 validation_ctc += float(ctc_loss(logits.log_softmax(-1).transpose(0, 1), texts, memory_lengths, text_lengths)); batches += 1
+                acoustic_logits = diagnostics["acoustic_logits"]
+                if acoustic_logits is not None:
+                    validation_acoustic_ctc += float(ctc_loss(acoustic_logits.log_softmax(-1).transpose(0, 1), texts, diagnostics["acoustic_lengths"], text_lengths))
                 decoded = greedy_decode(logits.cpu(), memory_lengths.cpu())
+                acoustic_decoded = greedy_decode(acoustic_logits.cpu(), diagnostics["acoustic_lengths"].cpu()) if acoustic_logits is not None else decoded
                 for index, hypothesis in enumerate(decoded):
-                    reference = texts[index, :text_lengths[index]].cpu().tolist(); edits += _edit_distance(reference, hypothesis); characters += len(reference)
+                    reference = texts[index, :text_lengths[index]].cpu().tolist(); edits += _edit_distance(reference, hypothesis); acoustic_edits += _edit_distance(reference, acoustic_decoded[index]); characters += len(reference)
                 retrieval_hits += int((audio_embedding @ text_embedding.T).argmax(1).eq(torch.arange(len(inputs), device=device)).sum()); samples += len(inputs)
-        validation_cer = edits / max(characters, 1); validation_retrieval = retrieval_hits / samples
-        metrics = {"epoch": epoch + 1, "step": step, "train_loss": total / count, "validation_ctc": validation_ctc / batches, "validation_cer": validation_cer, "validation_retrieval_top1": validation_retrieval, "selection_score": validation_cer - 0.5 * validation_retrieval}
+        validation_cer = edits / max(characters, 1); acoustic_cer = acoustic_edits / max(characters, 1); validation_retrieval = retrieval_hits / samples
+        metrics = {"epoch": epoch + 1, "step": step, "train_loss": total / count, "validation_ctc": validation_ctc / batches, "validation_acoustic_ctc": validation_acoustic_ctc / batches if model_config.acoustic_ctc else None, "validation_cer": validation_cer, "validation_acoustic_cer": acoustic_cer if model_config.acoustic_ctc else None, "validation_retrieval_top1": validation_retrieval, "selection_score": validation_cer - 0.5 * validation_retrieval}
         history.append(metrics); print(json.dumps(metrics), flush=True)
-        architecture = "content_token_memory_sequence" if model_config.sequence_contrastive else "content_token_memory"
+        architecture = _architecture(model_config)
         checkpoint = {"architecture": architecture, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "stats": stats, "model_config": asdict(model_config), "training_config": asdict(training), "vocabulary": vocabulary.symbols, "history": history}
         torch.save(checkpoint, output_dir / "last.pt")
         best_cer = min(best_cer, metrics["validation_cer"])
         if metrics["selection_score"] < best_score:
             best_score = metrics["selection_score"]; torch.save(checkpoint, output_dir / "best.pt")
         if step >= training.max_steps: break
-    architecture = "content_token_memory_sequence" if model_config.sequence_contrastive else "content_token_memory"
+    architecture = _architecture(model_config)
     report = {"architecture": architecture, "steps": step, "best_validation_cer": best_cer, "best_selection_score": best_score, "history": history}
     (output_dir / "training_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"); return report
 

@@ -16,6 +16,9 @@ class ContentMemoryConfig:
     contrastive_dim: int = 128
     sequence_contrastive: bool = False
     sequence_layers: int = 1
+    local_encoder_layers: int = 4
+    local_kernel_size: int = 5
+    acoustic_ctc: bool = False
 
 
 def create_content_memory(config: ContentMemoryConfig):
@@ -30,10 +33,24 @@ def create_content_memory(config: ContentMemoryConfig):
             self.config = config
             self.input_norm = nn.LayerNorm(config.n_mels + 2)
             self.input_projection = nn.Linear(config.n_mels + 2, dim)
+            self.local_encoder = nn.ModuleList([
+                nn.Sequential(
+                    nn.LayerNorm(dim), nn.Linear(dim, dim * 2), nn.SiLU(),
+                    nn.Linear(dim * 2, dim),
+                ) for _ in range(config.local_encoder_layers)
+            ])
+            self.local_convolution = nn.ModuleList([
+                nn.Conv1d(dim, dim, config.local_kernel_size, groups=dim)
+                for _ in range(config.local_encoder_layers)
+            ])
             self.level_embedding = nn.Parameter(torch.randn(config.token_slots, dim) * 0.02)
             self.optimizer = nn.GRUCell(dim, dim)
             self.write_gate = nn.Sequential(nn.Linear(dim * 3 + 1, dim), nn.SiLU(), nn.Linear(dim, 1))
             self.ctc_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, config.vocabulary_size))
+            self.acoustic_ctc_head = (
+                nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, config.vocabulary_size))
+                if config.acoustic_ctc else None
+            )
             if config.sequence_contrastive:
                 self.audio_sequence = nn.GRU(
                     dim, dim, config.sequence_layers, batch_first=True, bidirectional=True,
@@ -69,11 +86,19 @@ def create_content_memory(config: ContentMemoryConfig):
             batch = len(inputs); stride = config.update_stride
             updates = (frame_lengths + stride - 1) // stride
             memory_lengths = updates.clamp(max=config.token_slots)
+            encoded_frames = self.input_projection(self.input_norm(inputs))
+            # Strictly causal local context: only left padding is visible.
+            for convolution, feed_forward in zip(self.local_convolution, self.local_encoder):
+                causal = functional.pad(encoded_frames.transpose(1, 2), (config.local_kernel_size - 1, 0))
+                encoded_frames = encoded_frames + convolution(causal).transpose(1, 2)
+                encoded_frames = encoded_frames + feed_forward(encoded_frames)
+            acoustic_sequence = []
             tokens = torch.zeros(batch, config.token_slots, config.hidden_dim, device=inputs.device, dtype=inputs.dtype)
             write_history = []
             for update in range(int(updates.max())):
                 start = update * stride; end = min(start + stride, inputs.shape[1])
-                encoded = self.input_projection(self.input_norm(inputs[:, start:end])).mean(1)
+                encoded = encoded_frames[:, start:end].mean(1)
+                acoustic_sequence.append(encoded)
                 vad = inputs[:, start:end, -1].mean(1)
                 active = update < updates
                 tokens, write = self._update(encoded, vad, tokens, active)
@@ -82,6 +107,8 @@ def create_content_memory(config: ContentMemoryConfig):
             for index, length in enumerate(memory_lengths.tolist()):
                 ordered[index, :length] = tokens[index, :length].flip(0)
             logits = self.ctc_head(ordered)
+            acoustic_features = torch.stack(acoustic_sequence, 1)
+            acoustic_logits = self.acoustic_ctc_head(acoustic_features) if self.acoustic_ctc_head is not None else None
             positions = torch.arange(config.token_slots, device=inputs.device).unsqueeze(0)
             valid = positions < memory_lengths.unsqueeze(1)
             if config.sequence_contrastive:
@@ -106,7 +133,11 @@ def create_content_memory(config: ContentMemoryConfig):
                 else:
                     text_pool = (embedded_text * text_valid.unsqueeze(-1)).sum(1) / text_lengths.clamp_min(1).unsqueeze(1)
                 text_embedding = functional.normalize(self.text_projection(text_pool), dim=-1)
-            diagnostics = {"write_strength": torch.stack(write_history, 1)}
+            diagnostics = {
+                "write_strength": torch.stack(write_history, 1),
+                "acoustic_logits": acoustic_logits,
+                "acoustic_lengths": updates,
+            }
             return logits, memory_lengths, audio_embedding, text_embedding, diagnostics
 
         def export_config(self): return asdict(config)
