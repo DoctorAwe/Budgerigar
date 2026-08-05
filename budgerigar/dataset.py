@@ -37,11 +37,12 @@ class ParallelSpeechDataset(Dataset):
             start = random.randint(0, len(source) - self.segment_frames)
             source = source[start:start + self.segment_frames]
             target = target[start:start + self.segment_frames]
-        return source, target, item["source_speaker"], item["utterance_id"]
+        return source, target, item["source_speaker"], item["target_speaker"], item["utterance_id"]
 
 
 def collate_parallel(batch):
     frames = min(item[0].shape[0] for item in batch)
     source = torch.stack([item[0][:frames] for item in batch])
     target = torch.stack([item[1][:frames] for item in batch])
-    return source, target
+    target_speakers = [item[3] for item in batch]
+    return source, target, target_speakers

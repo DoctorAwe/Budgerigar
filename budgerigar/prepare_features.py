@@ -15,19 +15,24 @@ def process_item(task: tuple[dict, str, float]) -> dict:
     item, output_string, band_radius = task
     output = Path(output_string)
     speaker = item["source_speaker"]
+    target_speaker = item["target_speaker"]
     utterance = item["utterance_id"]
-    source_path = output / f"{speaker}_{utterance}_source.pt"
-    target_path = output / f"{speaker}_{utterance}_target_dtw.pt"
-    if not source_path.exists() or not target_path.exists():
+    pair_name = f"{speaker}_to_{target_speaker}_{utterance}"
+    source_path = output / f"{pair_name}_source.pt"
+    target_path = output / f"{pair_name}_target_dtw.pt"
+    raw_target_path = output / f"{pair_name}_target_raw.pt"
+    if not source_path.exists() or not target_path.exists() or not raw_target_path.exists():
         audio = AudioConfig()
         source = log_mel(load_wave(item["source_path"], audio.sample_rate), audio)
         target = log_mel(load_wave(item["target_path"], audio.sample_rate), audio)
         aligned_target = dtw_align_target(source, target, band_radius)
         torch.save(source.contiguous(), source_path)
         torch.save(aligned_target.contiguous(), target_path)
+        torch.save(target.contiguous(), raw_target_path)
     cached = dict(item)
     cached["source_mel_path"] = str(source_path.resolve())
     cached["target_mel_path"] = str(target_path.resolve())
+    cached["raw_target_mel_path"] = str(raw_target_path.resolve())
     cached["alignment"] = "dtw"
     return cached
 
@@ -61,4 +66,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

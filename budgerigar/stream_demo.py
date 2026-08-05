@@ -57,18 +57,26 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("output.wav"))
     parser.add_argument("--chunk-ms", type=int, default=320)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--target-speaker", help="Required for a multi-speaker checkpoint")
     args = parser.parse_args()
     device = choose_device(args.device)
     saved = torch.load(args.checkpoint, map_location=device, weights_only=False)
     model = BudgerigarModel(BudgerigarConfig(**saved["config"])).to(device)
     model.load_state_dict(saved["model"])
     model.eval()
+    target_ids = None
+    if model.config.speaker_names:
+        if not args.target_speaker:
+            raise ValueError(f"--target-speaker is required; choose from {model.config.speaker_names}")
+        target_ids = torch.tensor([model.speaker_index(args.target_speaker)], device=device)
     audio = AudioConfig()
     features = log_mel(load_wave(args.input, audio.sample_rate), audio).to(device)
     chunk_frames = max(1, round(args.chunk_ms / 1000 * audio.sample_rate / audio.hop_length))
     state, output = None, []
     for start in range(0, len(features), chunk_frames):
-        prediction, state = model.forward_chunk(features[None, start:start + chunk_frames], state)
+        prediction, state = model.forward_chunk(
+            features[None, start:start + chunk_frames], state, target_speaker=target_ids,
+        )
         output.append(prediction[0].cpu())
     waveform = approximate_waveform(torch.cat(output), audio, phase_reference=load_wave(args.input, audio.sample_rate))
     import torchaudio

@@ -54,7 +54,11 @@ def main() -> None:
         drop_last=True, num_workers=args.num_workers, pin_memory=device.type == "cuda",
         persistent_workers=args.num_workers > 0,
     )
-    config = BudgerigarConfig(token_dim=args.token_dim, layers=args.layers)
+    speaker_names = tuple(sorted({item["target_speaker"] for item in dataset.items}))
+    config = BudgerigarConfig(
+        token_dim=args.token_dim, layers=args.layers,
+        speaker_names=speaker_names if len(speaker_names) > 1 else (),
+    )
     model = BudgerigarModel(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
@@ -62,9 +66,15 @@ def main() -> None:
     log_started = time.perf_counter()
     model.train()
     while step < args.steps:
-        for source, target in loader:
+        for source, target, target_names in loader:
             source = source.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
+            target_ids = None
+            if config.speaker_names:
+                target_ids = torch.tensor(
+                    [config.speaker_names.index(name) for name in target_names],
+                    device=device, dtype=torch.long,
+                )
             optimizer.zero_grad(set_to_none=True)
             state = None
             predictions = []
@@ -72,7 +82,9 @@ def main() -> None:
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
                 width = args.train_chunk_frames or source.shape[1]
                 while cursor < source.shape[1]:
-                    output, state = model.forward_chunk(source[:, cursor:cursor + width], state)
+                    output, state = model.forward_chunk(
+                        source[:, cursor:cursor + width], state, target_speaker=target_ids,
+                    )
                     predictions.append(output)
                     cursor += width
                 prediction = torch.cat(predictions, dim=1)

@@ -86,7 +86,7 @@ MANIFEST_ROOT = PROJECT_ROOT / "data/arctic"
 # 首版固定 slt 为输出音色，bdl 为输入真人。可以向 SOURCES 加入
 # clb/rms/jmk/ksp；加入其他说话人前请先核对官方许可。
 TARGET_SPEAKER = "slt"
-SOURCES = ["bdl"]
+SOURCES = ["bdl", "clb", "rms"]
 # SHA-256 来自 torchaudio 的 CMUARCTIC 数据集实现。
 CHECKSUMS = {
     "bdl": "26b91aaf48b2799b2956792b4632c2f926cd0542f402b5452d5adecb60942904",
@@ -379,3 +379,141 @@ data/arctic_dtw/validation.jsonl
 - `chunk_max_error`：整段与流式分块的一致性。
 
 建议以“验证 MAE 下降、改善率提高、动态范围接近 1”共同选择 checkpoint，而不是只看训练 loss。
+
+## 10. 第三阶段：多目标音色与实时自主开口
+
+这一阶段不加载旧 checkpoint。默认下载单元格中的 `SOURCES = ["bdl", "clb", "rms"]`，再加固定下载的 `slt`，共得到四名真人。若此前只下载了 `bdl/slt`，重新运行第 3 节下载单元格会补齐缺少的 `clb/rms`。
+
+生成四名说话人的所有有序转换方向：
+
+```bash
+!python -m budgerigar.prepare_arctic \
+  --root /content/data/cmu_arctic \
+  --output data/arctic_multi \
+  --all-targets
+```
+
+四名说话人会形成 12 个转换方向。训练和验证仍按 utterance ID 划分，避免同一句话泄漏。
+
+生成多目标缓存。该步骤会额外保留目标真人原始长度的 Mel，供时长和语气模型学习：
+
+```bash
+!python -m budgerigar.prepare_features \
+  --manifest data/arctic_multi/train.jsonl \
+  --output data/arctic_multi_dtw \
+  --workers 2
+
+!python -m budgerigar.prepare_features \
+  --manifest data/arctic_multi/validation.jsonl \
+  --output data/arctic_multi_dtw \
+  --workers 2
+```
+
+### 10.1 多音色、可变时长声学预训练
+
+V2 使用目标说话人 embedding、4 层 Conformer 内容编码器、时长预测器和3层交叉注意力解码器。它负责学习“说什么、使用谁的音色、目标句子多长”，但不负责最终的实时开口决策。
+
+```bash
+!python -m budgerigar.train_v2 \
+  --manifest data/arctic_multi_dtw/train.jsonl \
+  --steps 30000 \
+  --batch-size 2 \
+  --gradient-accumulation 4 \
+  --hidden-dim 256 \
+  --checkpoint checkpoints/budgerigar_v2_acoustic.pt \
+  --device cuda
+```
+
+```bash
+!python -m budgerigar.evaluate_v2 \
+  --manifest data/arctic_multi_dtw/validation.jsonl \
+  --checkpoint checkpoints/budgerigar_v2_acoustic.pt \
+  --device cuda
+```
+
+### 10.2 连续流与自主开口策略
+
+实时系统把监听和输出视为两个独立时钟。训练程序会把多条验证式录音拼成连续流，加入随机停顿，并生成四类动作：
+
+```text
+WAIT  继续监听
+START 识别到完整句子且输出通道空闲，立即开始
+EMIT  继续输出当前句
+STOP  当前句输出完成
+```
+
+VAD/能量变化只是模型输入的一部分，不是硬触发条件。若上一句仍在输出，新完成的句子进入队列；输入流始终继续处理。
+
+```bash
+!python -m budgerigar.train_policy \
+  --manifest data/arctic_multi_dtw/train.jsonl \
+  --steps 10000 \
+  --episodes 20000 \
+  --batch-size 2 \
+  --checkpoint checkpoints/realtime_policy.pt \
+  --device cuda
+```
+
+重点观察 `endpoint_recall`，但不能只看总体 `action_acc`，因为 WAIT 帧数量远多于 START/STOP。后续实时评估必须分别报告句末漏检、误触发率和开口延迟。
+
+## 11. 当前主线：统一时域流处理器
+
+根据最终产品定义，独立策略模型和 Mel 声码器不再是主线。统一模型的接口为：
+
+```python
+wave_out, hidden = model.forward_chunk(wave_in, target_speaker, hidden)
+```
+
+每输入 160 samples（16 kHz 下 10 ms），模型返回等长的 160 samples。没有需要复述的内容时，输出波形自然接近零；识别到完整句子后，输出自然过渡为目标真人波形。外部程序不提供 VAD、动作或发声队列。
+
+该模型直接使用 `data/arctic_multi` 中的原始 WAV，不需要 DTW Mel 缓存。
+
+先做 100-step 冒烟训练：
+
+```bash
+!python -m budgerigar.train_waveform \
+  --manifest data/arctic_multi/train.jsonl \
+  --steps 100 \
+  --episodes 500 \
+  --utterances-per-episode 1 \
+  --batch-size 1 \
+  --gradient-accumulation 4 \
+  --hidden-dim 256 \
+  --checkpoint checkpoints/budgerigar_waveform_smoke.pt \
+  --device cuda
+```
+
+冒烟训练无 NaN/OOM 后启动正式训练：
+
+```bash
+!python -m budgerigar.train_waveform \
+  --manifest data/arctic_multi/train.jsonl \
+  --steps 30000 \
+  --episodes 30000 \
+  --utterances-per-episode 1 \
+  --batch-size 1 \
+  --gradient-accumulation 4 \
+  --chunk-frames 256 \
+  --hidden-dim 256 \
+  --checkpoint checkpoints/budgerigar_waveform.pt \
+  --device cuda
+```
+
+评估完整波形与 10 ms/160 ms 分块行为：
+
+```bash
+!python -m budgerigar.evaluate_waveform \
+  --manifest data/arctic_multi/validation.jsonl \
+  --checkpoint checkpoints/budgerigar_waveform.pt \
+  --episodes 100 \
+  --device cuda
+```
+
+评估指标：
+
+- `output_silence_rms`：应保持较低，衡量误发声和底噪；
+- `output_speech_rms`：不应趋近零，否则发生全静音坍缩；
+- `target_speech_rms`：目标真人语音能量参考；
+- `chunk_max_error`：整段与分块输出应接近一致。
+
+当前训练损失包含多分辨率 STFT、语音区加权波形误差和能量包络误差。下一阶段会增加波形判别器、内容感知和说话人相似度损失。

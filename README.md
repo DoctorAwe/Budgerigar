@@ -1,9 +1,9 @@
 # Budgerigar / 鹦鹉学舌模型
 
-Budgerigar 是一个因果流式的语音复述基线：输入真人语音的 Mel 流，模型使用固定目标音色重建相同内容。当前里程碑聚焦 CMU ARCTIC 的“同句、不同真人”平行训练。
+Budgerigar 的当前主线是统一的因果流式波形处理器：持续接收真人时域音频，并持续返回等长时域音频。静音、开始复述、内容、音色和结束全部由模型输出波形表达，不使用外部 VAD、发声动作或 Griffin-Lim。
 
 ```text
-waveform -> log-Mel -> causal token pipeline -> target log-Mel -> waveform
+waveform -> causal encoder -> recurrent/attention memory -> internal waveform decoder -> waveform
 ```
 
 ## 快速开始
@@ -11,10 +11,9 @@ waveform -> log-Mel -> causal token pipeline -> target log-Mel -> waveform
 ```bash
 pip install -e .
 python -m budgerigar.prepare_arctic --root /path/to/cmu_arctic --output data/arctic
-python -m budgerigar.train --manifest data/arctic/train.jsonl --device cuda
-python -m budgerigar.evaluate --manifest data/arctic/validation.jsonl \
-  --checkpoint checkpoints/budgerigar.pt --device cuda
+python -m budgerigar.train_waveform --manifest data/arctic_multi/train.jsonl --device cuda
+python -m budgerigar.evaluate_waveform --manifest data/arctic_multi/validation.jsonl \
+  --checkpoint checkpoints/budgerigar_waveform.pt --device cuda
 ```
 
 详细的 Colab 流程见 [COLAB_TRAINING.md](COLAB_TRAINING.md)，设计与阶段边界见 [PROJECT_PLAN.md](PROJECT_PLAN.md)。
-

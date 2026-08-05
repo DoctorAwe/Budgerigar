@@ -12,6 +12,7 @@ class BudgerigarConfig:
     token_dim: int = 192
     layers: int = 16
     dropout: float = 0.0
+    speaker_names: tuple[str, ...] = ()
 
 
 @dataclass
@@ -52,6 +53,10 @@ class BudgerigarModel(nn.Module):
             nn.GELU(),
             nn.Linear(config.token_dim, config.token_dim),
         )
+        self.speaker_embedding = (
+            nn.Embedding(len(config.speaker_names), config.token_dim)
+            if config.speaker_names else None
+        )
         self.pipeline = nn.ModuleList([
             CausalTokenLayer(config.token_dim, index, config.layers, config.dropout)
             for index in range(config.layers)
@@ -67,7 +72,15 @@ class BudgerigarModel(nn.Module):
         empty = tuple(torch.zeros(batch, self.config.token_dim, device=device, dtype=dtype) for _ in self.pipeline)
         return BudgerigarState(empty)
 
-    def forward_chunk(self, mel: Tensor, state: BudgerigarState | None = None) -> tuple[Tensor, BudgerigarState]:
+    def speaker_index(self, name: str) -> int:
+        if name not in self.config.speaker_names:
+            raise ValueError(f"Unknown target speaker {name!r}; expected {self.config.speaker_names}")
+        return self.config.speaker_names.index(name)
+
+    def forward_chunk(
+        self, mel: Tensor, state: BudgerigarState | None = None,
+        target_speaker: Tensor | None = None,
+    ) -> tuple[Tensor, BudgerigarState]:
         if mel.ndim != 3 or mel.shape[-1] != self.config.n_mels:
             raise ValueError(f"Expected [batch,time,{self.config.n_mels}], got {tuple(mel.shape)}")
         if state is None:
@@ -77,6 +90,12 @@ class BudgerigarModel(nn.Module):
         if mel.shape[1] == 0:
             return mel.new_empty(mel.shape), state
         encoded = self.encoder(mel)
+        if self.speaker_embedding is not None:
+            if target_speaker is None:
+                raise ValueError("target_speaker IDs are required by this multi-speaker model")
+            if target_speaker.shape != (mel.shape[0],):
+                raise ValueError(f"target_speaker must be [batch], got {tuple(target_speaker.shape)}")
+            encoded = encoded + self.speaker_embedding(target_speaker).unsqueeze(1)
         previous = state.layers
         source = encoded
         updated = []
@@ -90,5 +109,5 @@ class BudgerigarModel(nn.Module):
         output = self.readout(torch.cat([encoded, source], dim=-1))
         return output, BudgerigarState(tuple(updated), state.steps + mel.shape[1])
 
-    def forward(self, mel: Tensor) -> Tensor:
-        return self.forward_chunk(mel)[0]
+    def forward(self, mel: Tensor, target_speaker: Tensor | None = None) -> Tensor:
+        return self.forward_chunk(mel, target_speaker=target_speaker)[0]

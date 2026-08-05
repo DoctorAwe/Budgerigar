@@ -40,3 +40,12 @@ def test_empty_chunk_keeps_state():
     output, next_state = model.forward_chunk(torch.empty(1, 0, 8), state)
     assert output.shape == (1, 0, 8)
     assert next_state.steps == state.steps
+
+
+def test_target_speaker_condition_changes_output():
+    config = BudgerigarConfig(n_mels=8, token_dim=16, layers=2, speaker_names=("bdl", "slt"))
+    model = BudgerigarModel(config).eval()
+    inputs = torch.randn(1, 5, 8)
+    bdl = model(inputs, torch.tensor([0]))
+    slt = model(inputs, torch.tensor([1]))
+    assert not torch.allclose(bdl, slt)

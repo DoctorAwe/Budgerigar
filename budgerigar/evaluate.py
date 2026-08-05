@@ -32,12 +32,19 @@ def main() -> None:
     )
     absolute_error = copy_error = equivalence_error = elements = 0.0
     output_sum = output_square_sum = target_sum = target_square_sum = 0.0
-    for source, target in loader:
+    for source, target, target_names in loader:
         source, target = source.to(device), target.to(device)
-        whole = model(source)
+        target_ids = None
+        if model.config.speaker_names:
+            target_ids = torch.tensor(
+                [model.speaker_index(name) for name in target_names], device=device,
+            )
+        whole = model(source, target_speaker=target_ids)
         state, pieces = None, []
         for start in range(0, source.shape[1], args.chunk_frames):
-            output, state = model.forward_chunk(source[:, start:start + args.chunk_frames], state)
+            output, state = model.forward_chunk(
+                source[:, start:start + args.chunk_frames], state, target_speaker=target_ids,
+            )
             pieces.append(output)
         chunked = torch.cat(pieces, 1)
         absolute_error += (whole - target).abs().sum().item()

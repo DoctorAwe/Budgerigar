@@ -44,11 +44,18 @@ def visualization(source: torch.Tensor, prediction: torch.Tensor, state_energy: 
 
 
 @torch.inference_mode()
-def convert(audio_path: str | None, checkpoint_path: str, chunk_ms: int, device_name: str):
+def convert(
+    audio_path: str | None, checkpoint_path: str, chunk_ms: int,
+    device_name: str, target_speaker: str,
+):
     if not audio_path:
         raise ValueError("请先上传音频或使用麦克风录音")
     model = load_model(checkpoint_path, device_name)
     device = next(model.parameters()).device
+    target_ids = None
+    if model.config.speaker_names:
+        selected = target_speaker or model.config.speaker_names[0]
+        target_ids = torch.tensor([model.speaker_index(selected)], device=device)
     audio = AudioConfig(n_mels=model.config.n_mels)
     waveform = load_wave(audio_path, audio.sample_rate)
     if waveform.numel() < audio.win_length:
@@ -64,7 +71,7 @@ def convert(audio_path: str | None, checkpoint_path: str, chunk_ms: int, device_
     started = time.perf_counter()
     for start in range(0, len(features), chunk_frames):
         chunk = features[None, start:start + chunk_frames].to(device)
-        prediction, state = model.forward_chunk(chunk, state)
+        prediction, state = model.forward_chunk(chunk, state, target_speaker=target_ids)
         outputs.append(prediction[0].cpu())
         stacked = torch.stack(state.layers)
         state_energy.append(float(stacked.float().square().mean().sqrt().cpu()))
@@ -114,6 +121,8 @@ def build_app(
     import gradio as gr
 
     examples = validation_examples(validation_manifest, max_examples)
+    saved = torch.load(default_checkpoint, map_location="cpu", weights_only=False)
+    checkpoint_speakers = tuple(saved.get("config", {}).get("speaker_names", ()))
 
     def select_example(label: str):
         if not label or label not in examples:
@@ -148,6 +157,12 @@ def build_app(
                 with gr.Row():
                     chunk_ms = gr.Slider(80, 1000, value=320, step=40, label="流式分块（ms）")
                     device = gr.Dropdown(["auto", "cuda", "cpu"], value=default_device, label="设备")
+                target_speaker = gr.Dropdown(
+                    choices=list(checkpoint_speakers),
+                    value=checkpoint_speakers[0] if checkpoint_speakers else None,
+                    label="目标说话人",
+                    visible=bool(checkpoint_speakers),
+                )
                 run = gr.Button("开始模仿", variant="primary")
                 gr.Markdown("提示：当前使用输入相位辅助诊断合成；可懂度可用于检查模型，但最终音色仍需神经声码器。")
             with gr.Column(scale=1):
@@ -157,7 +172,7 @@ def build_app(
         plot = gr.Plot(label="声学与状态可视化")
         run.click(
             fn=convert,
-            inputs=[audio_input, checkpoint, chunk_ms, device],
+            inputs=[audio_input, checkpoint, chunk_ms, device, target_speaker],
             outputs=[audio_output, plot, metrics],
         )
         if examples:
