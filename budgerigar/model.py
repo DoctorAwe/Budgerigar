@@ -24,24 +24,20 @@ class BudgerigarState:
 
 
 class CausalTokenLayer(nn.Module):
-    """One stateful stage. Incoming values are always from the previous time step."""
+    """One fused recurrent stage for an entire chunk."""
 
     def __init__(self, dim: int, depth: int, count: int, dropout: float):
         super().__init__()
-        self.norm = nn.LayerNorm(dim * 2)
-        self.candidate = nn.Sequential(
-            nn.Linear(dim * 2, dim * 2), nn.GELU(), nn.Dropout(dropout), nn.Linear(dim * 2, dim),
-        )
-        self.gate = nn.Linear(dim * 2, dim)
+        self.input_norm = nn.LayerNorm(dim)
+        self.recurrent = nn.GRU(dim, dim, batch_first=True)
+        # Deeper stages start with a stronger update-gate retention prior.
         retention = 0.25 + 0.70 * depth / max(count - 1, 1)
-        nn.init.zeros_(self.gate.weight)
-        nn.init.constant_(self.gate.bias, torch.logit(torch.tensor(retention)).item())
+        with torch.no_grad():
+            self.recurrent.bias_ih_l0[dim:2 * dim].fill_(torch.logit(torch.tensor(retention)))
 
-    def forward(self, state: Tensor, incoming: Tensor) -> Tensor:
-        joined = self.norm(torch.cat([state, incoming], dim=-1))
-        proposal = torch.tanh(self.candidate(joined))
-        retain = torch.sigmoid(self.gate(joined))
-        return retain * state + (1.0 - retain) * proposal
+    def forward_sequence(self, incoming: Tensor, state: Tensor) -> tuple[Tensor, Tensor]:
+        output, final = self.recurrent(self.input_norm(incoming), state.unsqueeze(0))
+        return output, final[0]
 
 
 class BudgerigarModel(nn.Module):
@@ -78,22 +74,21 @@ class BudgerigarModel(nn.Module):
             state = self.init_state(mel.shape[0], mel.device, mel.dtype)
         if len(state.layers) != len(self.pipeline):
             raise ValueError("State layer count differs from model configuration")
+        if mel.shape[1] == 0:
+            return mel.new_empty(mel.shape), state
         encoded = self.encoder(mel)
-        outputs = []
-        running = state
-        for time in range(mel.shape[1]):
-            perception = encoded[:, time]
-            previous = running.layers
-            updated = []
-            for index, layer in enumerate(self.pipeline):
-                incoming = perception if index == 0 else previous[index - 1]
-                updated.append(layer(previous[index], incoming))
-            outputs.append(self.readout(torch.cat([perception, updated[-1]], dim=-1)))
-            running = BudgerigarState(tuple(updated), running.steps + 1)
-        if not outputs:
-            return mel.new_empty(mel.shape), running
-        return torch.stack(outputs, dim=1), running
+        previous = state.layers
+        source = encoded
+        updated = []
+        for index, layer in enumerate(self.pipeline):
+            # Stage zero receives the current acoustic frame. Every deeper
+            # stage receives the preceding stage delayed by exactly one frame.
+            if index:
+                source = torch.cat([previous[index - 1].unsqueeze(1), source[:, :-1]], dim=1)
+            source, final = layer.forward_sequence(source, previous[index])
+            updated.append(final)
+        output = self.readout(torch.cat([encoded, source], dim=-1))
+        return output, BudgerigarState(tuple(updated), state.steps + mel.shape[1])
 
     def forward(self, mel: Tensor) -> Tensor:
         return self.forward_chunk(mel)[0]
-
