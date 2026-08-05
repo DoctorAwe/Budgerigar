@@ -115,7 +115,12 @@ class EchoEpisodeDataset:
         inputs = torch.cat([input_mel, (energy / 80.0).unsqueeze(-1), input_vad.unsqueeze(-1)], -1)
         outputs = silence.repeat(total_frames, 1); outputs[repeat_start:] = target
         voice = torch.zeros(total_frames); voice[repeat_start:] = target_payload["vad"][:len(target)].float()
-        return inputs, outputs, voice, pair.source_id
+        metadata = {
+            "source_id": pair.source_id, "source_frames": len(source),
+            "thinking_frames": thinking_frames, "repeat_start": repeat_start,
+            "target_frames": len(target), "total_frames": total_frames,
+        }
+        return inputs, outputs, voice, metadata
 
 
 def collate_episodes(batch):
