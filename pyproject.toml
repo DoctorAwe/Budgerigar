@@ -23,6 +23,7 @@ budgerigar-train-echo = "budgerigar.train_echo:main"
 budgerigar-evaluate-echo = "budgerigar.evaluate_echo:main"
 budgerigar-evaluate-content = "budgerigar.evaluate_content:main"
 budgerigar-train-hierarchical = "budgerigar.train_hierarchical:main"
+budgerigar-train-content-memory = "budgerigar.train_content_memory:main"
 
 [tool.setuptools.packages.find]
 include = ["budgerigar*"]

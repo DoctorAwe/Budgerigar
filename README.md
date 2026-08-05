@@ -39,6 +39,8 @@ Colab 层级 token 记忆训练：[notebooks/Budgerigar_Hierarchical_Echo_Train.
 
 Colab 层级模型联合评估：[notebooks/Budgerigar_Hierarchical_Echo_Evaluate.ipynb](notebooks/Budgerigar_Hierarchical_Echo_Evaluate.ipynb)。同一 checkpoint 必须同时通过时间轴行为和内容保持评估。
 
+Colab 内容记忆预训练：[notebooks/Budgerigar_Content_Memory_Train.ipynb](notebooks/Budgerigar_Content_Memory_Train.ipynb)。在重新训练声学复读前，用 transcript CTC 与音频—文本 InfoNCE 强制 token bank 保存可恢复语言内容。
+
 ## 文档导航
 
 1. [阶段 0：问题定义与验收标准](docs/01_阶段0_问题定义.md)
