@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-from .audio import AudioConfig, load_wave, log_mel
+from .audio import AudioConfig, load_wave, log_mel, mel_filterbank
 from .model import BudgerigarConfig, BudgerigarModel
 from .train import choose_device
 
@@ -16,12 +16,13 @@ def approximate_waveform(log_mel_features: torch.Tensor, audio: AudioConfig) -> 
         import torchaudio
     except ImportError as error:
         raise RuntimeError("torchaudio is required to synthesize the demo WAV") from error
-    mel = log_mel_features.transpose(0, 1).exp().cpu()
-    inverse = torchaudio.transforms.InverseMelScale(
-        n_stft=audio.n_fft // 2 + 1, n_mels=audio.n_mels,
-        sample_rate=audio.sample_rate, f_min=audio.f_min, f_max=audio.f_max,
-    )
-    spectrum = inverse(mel).clamp_min(1e-8).sqrt()
+    # InverseMelScale uses an exact least-squares solve which can fail when
+    # adjacent low-frequency Mel bands map to the same FFT bin. A truncated
+    # Moore-Penrose inverse is stable for this intentionally lossy operation.
+    mel_power = log_mel_features.float().clamp(-11.5, 12.0).transpose(0, 1).exp().cpu()
+    filters = mel_filterbank(audio, device="cpu", dtype=torch.float32)
+    inverse_filters = torch.linalg.pinv(filters, rtol=1e-4)
+    spectrum = (inverse_filters @ mel_power).clamp_min(1e-8).sqrt()
     return torchaudio.transforms.GriffinLim(
         n_fft=audio.n_fft, hop_length=audio.hop_length, win_length=audio.win_length,
     )(spectrum)
@@ -57,4 +58,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
