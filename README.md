@@ -37,6 +37,8 @@ Colab 内容保持评估：[notebooks/Budgerigar_Neural_Echo_Content_Evaluate.ip
 
 Colab 层级 token 记忆训练：[notebooks/Budgerigar_Hierarchical_Echo_Train.ipynb](notebooks/Budgerigar_Hierarchical_Echo_Train.ipynb)。针对第一代内容检索失败，引入 AutoMachine 式 token bank、注意力读取和打乱目标对比损失。
 
+Colab 层级模型联合评估：[notebooks/Budgerigar_Hierarchical_Echo_Evaluate.ipynb](notebooks/Budgerigar_Hierarchical_Echo_Evaluate.ipynb)。同一 checkpoint 必须同时通过时间轴行为和内容保持评估。
+
 ## 文档导航
 
 1. [阶段 0：问题定义与验收标准](docs/01_阶段0_问题定义.md)

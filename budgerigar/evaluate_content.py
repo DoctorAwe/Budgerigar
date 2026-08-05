@@ -7,7 +7,8 @@ from pathlib import Path
 from statistics import mean
 
 from .echo_data import EchoEpisodeDataset, load_pairs
-from .neural_echo import NeuralEchoConfig, create_neural_echo, require_torch
+from .checkpoint_model import forward_echo, restore_echo_model
+from .neural_echo import require_torch
 
 
 def _resize(sequence, frames, functional):
@@ -50,8 +51,7 @@ def evaluate_content(
         raise ValueError("content evaluation needs at least two parallel pairs")
     dataset = EchoEpisodeDataset(pairs, checkpoint["stats"], thinking_frames, preload=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = create_neural_echo(NeuralEchoConfig(**checkpoint["model_config"])).to(device)
-    model.load_state_dict(checkpoint["model"]); model.eval()
+    model, architecture = restore_echo_model(checkpoint, device); model.eval()
 
     episodes = [dataset[index] for index in range(len(dataset))]
     target_sequences = [item[1][item[3]["repeat_start"]:] for item in episodes]
@@ -63,7 +63,7 @@ def evaluate_content(
     with torch.no_grad():
         for index, (inputs, target_timeline, _, metadata) in enumerate(episodes):
             repeat_start = metadata["repeat_start"]
-            predicted, _, _ = model(inputs.unsqueeze(0).to(device))
+            predicted, _, _, _ = forward_echo(model, architecture, inputs.unsqueeze(0).to(device))
             predicted = predicted[0, repeat_start:].cpu()
             correct = target_sequences[index]
             correct_distance = float((predicted - correct).abs().mean())
@@ -90,7 +90,9 @@ def evaluate_content(
             # Replace the source evidence with the same continuous silence seen later.
             silence_input = inputs[repeat_start].clone()
             ablated[:metadata["source_frames"]] = silence_input
-            predicted_ablated, _, _ = model(ablated.unsqueeze(0).to(device))
+            predicted_ablated, _, _, _ = forward_echo(
+                model, architecture, ablated.unsqueeze(0).to(device),
+            )
             predicted_ablated = predicted_ablated[0, repeat_start:].cpu()
             ablated_distances.append(float((predicted_ablated - correct).abs().mean()))
             output_changes.append(float((predicted_ablated - predicted).abs().mean()))
@@ -104,7 +106,8 @@ def evaluate_content(
 
     candidate_count = min(candidates, len(episodes))
     report = {
-        "checkpoint": str(Path(checkpoint_path).resolve()), "split": split,
+        "checkpoint": str(Path(checkpoint_path).resolve()), "architecture": architecture,
+        "split": split,
         "pairs": len(episodes), "candidates": candidate_count,
         "distance_l1": {
             "correct_target": mean(correct_distances),
@@ -142,4 +145,3 @@ def main() -> int:
 
 
 if __name__ == "__main__": raise SystemExit(main())
-

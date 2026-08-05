@@ -7,7 +7,8 @@ from pathlib import Path
 from statistics import mean, median
 
 from .echo_data import EchoEpisodeDataset, load_pairs
-from .neural_echo import NeuralEchoConfig, create_neural_echo, require_torch
+from .checkpoint_model import forward_echo, restore_echo_model
+from .neural_echo import require_torch
 
 
 def _first_true(values):
@@ -36,8 +37,7 @@ def evaluate_checkpoint(
         raise ValueError(f"no pairs found for split {split!r}")
     dataset = EchoEpisodeDataset(pairs, checkpoint["stats"], thinking_frames, preload=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = create_neural_echo(NeuralEchoConfig(**checkpoint["model_config"])).to(device)
-    model.load_state_dict(checkpoint["model"]); model.eval()
+    model, architecture = restore_echo_model(checkpoint, device); model.eval()
     examples = []
     listen_probs = []; thinking_probs = []; repeat_probs = []
     listen_false = []; thinking_false = []; repeat_recalls = []; onset_errors = []
@@ -45,7 +45,9 @@ def evaluate_checkpoint(
     with torch.no_grad():
         for index in range(len(dataset)):
             inputs, target_mel, target_voice, metadata = dataset[index]
-            predicted_mel, voice_logits, _ = model(inputs.unsqueeze(0).to(device))
+            predicted_mel, voice_logits, _, _ = forward_echo(
+                model, architecture, inputs.unsqueeze(0).to(device),
+            )
             predicted_mel = predicted_mel[0].cpu(); probability = voice_logits[0].sigmoid().cpu()
             source_end = metadata["source_frames"]; repeat_start = metadata["repeat_start"]; total = metadata["total_frames"]
             listen_slice = slice(0, source_end); thinking_slice = slice(source_end, repeat_start); repeat_slice = slice(repeat_start, total)
@@ -74,7 +76,8 @@ def evaluate_checkpoint(
                 })
     def average(values): return mean(values) if values else None
     report = {
-        "checkpoint": str(Path(checkpoint_path).resolve()), "split": split, "pairs": len(pairs),
+        "checkpoint": str(Path(checkpoint_path).resolve()), "architecture": architecture,
+        "split": split, "pairs": len(pairs),
         "threshold": threshold, "hop_ms": 10,
         "voice_probability": {"listen": average(listen_probs), "thinking": average(thinking_probs), "repeat": average(repeat_probs)},
         "false_voice_rate": {"listen": average(listen_false), "thinking": average(thinking_false)},
@@ -105,4 +108,3 @@ def main() -> int:
 
 
 if __name__ == "__main__": raise SystemExit(main())
-
