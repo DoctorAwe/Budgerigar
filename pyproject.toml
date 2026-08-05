@@ -18,6 +18,7 @@ data = ["datasets[audio]>=3.0"]
 [project.scripts]
 budgerigar-audit = "budgerigar.manifest:main"
 budgerigar-prepare = "budgerigar.data_prep:main"
+budgerigar-features = "budgerigar.features:main"
 
 [tool.setuptools.packages.find]
 include = ["budgerigar*"]

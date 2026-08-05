@@ -27,6 +27,8 @@ budgerigar-audit data/manifest.jsonl
 
 Colab 数据入口：[notebooks/Budgerigar_Data.ipynb](notebooks/Budgerigar_Data.ipynb)。它会下载并校验 CMU ARCTIC、索引用户已按官方研究条款取得的 ESD、运行真实 manifest 审计并保存运行元数据。
 
+Colab 特征入口：[notebooks/Budgerigar_Features.ipynb](notebooks/Budgerigar_Features.ipynb)。在数据审计通过后生成可恢复的 24 kHz log-Mel、能量和 VAD 缓存。
+
 ## 文档导航
 
 1. [阶段 0：问题定义与验收标准](docs/01_阶段0_问题定义.md)
