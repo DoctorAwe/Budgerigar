@@ -1,22 +1,30 @@
-import torch
-
-from budgerigar.audio import AudioConfig, align_target, log_mel, mel_filterbank
+from budgerigar.audio import AudioChunker, AudioConfig
 
 
-def test_log_mel_shape_and_finiteness():
-    config = AudioConfig(sample_rate=16_000, n_fft=400, n_mels=24)
-    result = log_mel(torch.randn(3_200), config)
-    assert result.shape[1] == 24
-    assert torch.isfinite(result).all()
+def test_irregular_blocks_become_exact_ticks():
+    config = AudioConfig(sample_rate=1_000, tick_ms=20, lookahead_ms=0)
+    chunker = AudioChunker(config)
+    assert chunker.push(range(7)) == []
+    ticks = chunker.push(range(7, 47))
+    assert len(ticks) == 2
+    assert ticks[0] == tuple(float(value) for value in range(20))
+    assert chunker.pending_samples == 7
 
 
-def test_alignment_changes_only_time_axis():
-    target = torch.randn(12, 8)
-    aligned = align_target(target, 19)
-    assert aligned.shape == (19, 8)
+def test_flush_reports_valid_samples_and_reset_clears_state():
+    chunker = AudioChunker(AudioConfig(sample_rate=1_000, tick_ms=10))
+    chunker.push([1.0, 2.0, 3.0])
+    tick, valid = chunker.flush()
+    assert valid == 3
+    assert tick == (1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    assert chunker.flush() == (None, 0)
 
 
-def test_filterbank_shape():
-    config = AudioConfig(n_fft=400, n_mels=32)
-    assert mel_filterbank(config).shape == (32, 201)
+def test_audio_config_rejects_fractional_tick():
+    try:
+        AudioConfig(sample_rate=22_050, tick_ms=17)
+    except ValueError as error:
+        assert "integer" in str(error)
+    else:
+        raise AssertionError("expected invalid tick configuration to fail")
 

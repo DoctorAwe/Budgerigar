@@ -1,10 +1,15 @@
-"""Causal streaming listen-and-repeat speech model."""
+"""Budgerigar streaming speech conversion research package."""
 
-from .audio import AudioConfig
-from .model import BudgerigarConfig, BudgerigarModel, BudgerigarState
-from .waveform_model import StreamingWaveformProcessor, WaveformProcessorConfig, WaveformProcessorState
+from .audio import AudioConfig, AudioChunker
+from .manifest import ManifestRecord, audit_manifest, load_manifest
 
 __all__ = [
-    "AudioConfig", "BudgerigarConfig", "BudgerigarModel", "BudgerigarState",
-    "StreamingWaveformProcessor", "WaveformProcessorConfig", "WaveformProcessorState",
+    "AudioChunker",
+    "AudioConfig",
+    "ManifestRecord",
+    "audit_manifest",
+    "load_manifest",
 ]
+
+__version__ = "0.1.0"
+
