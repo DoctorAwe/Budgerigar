@@ -29,6 +29,8 @@ Colab 数据入口：[notebooks/Budgerigar_Data.ipynb](notebooks/Budgerigar_Data
 
 Colab 特征入口：[notebooks/Budgerigar_Features.ipynb](notebooks/Budgerigar_Features.ipynb)。在数据审计通过后生成可恢复的 24 kHz log-Mel、能量和 VAD 缓存。
 
+Colab 连续神经复读基线：[notebooks/Budgerigar_Neural_Echo_Train.ipynb](notebooks/Budgerigar_Neural_Echo_Train.ipynb)。模型在同一连续时间轴上学习先听完整表达、保持静默，再用固定声线复读；不存在程序化的监听/结束/朗读状态机。
+
 ## 文档导航
 
 1. [阶段 0：问题定义与验收标准](docs/01_阶段0_问题定义.md)

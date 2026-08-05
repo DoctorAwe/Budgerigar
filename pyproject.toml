@@ -19,6 +19,7 @@ data = ["datasets[audio]>=3.0"]
 budgerigar-audit = "budgerigar.manifest:main"
 budgerigar-prepare = "budgerigar.data_prep:main"
 budgerigar-features = "budgerigar.features:main"
+budgerigar-train-echo = "budgerigar.train_echo:main"
 
 [tool.setuptools.packages.find]
 include = ["budgerigar*"]
