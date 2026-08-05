@@ -13,6 +13,7 @@ dependencies = []
 train = ["torch>=2.2", "torchaudio>=2.2"]
 dev = ["pytest>=8"]
 demo = ["gradio>=5"]
+data = ["datasets[audio]>=3.0"]
 
 [project.scripts]
 budgerigar-audit = "budgerigar.manifest:main"

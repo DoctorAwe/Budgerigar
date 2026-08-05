@@ -18,7 +18,7 @@ def file_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def collect_run_metadata(manifest: str | Path | None = None) -> dict:
+def collect_run_metadata(manifest: str | Path | None = None, extra: dict | None = None) -> dict:
     metadata = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "python": sys.version,
@@ -36,6 +36,8 @@ def collect_run_metadata(manifest: str | Path | None = None) -> dict:
     if manifest is not None:
         metadata["manifest"] = str(Path(manifest).resolve())
         metadata["manifest_sha256"] = file_sha256(manifest)
+    if extra:
+        metadata.update(extra)
     return metadata
 
 
@@ -46,9 +48,12 @@ def _command(command: list[str]) -> str | None:
         return None
 
 
-def write_run_metadata(destination: str | Path, manifest: str | Path | None = None) -> Path:
+def write_run_metadata(
+    destination: str | Path, manifest: str | Path | None = None, extra: dict | None = None,
+) -> Path:
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(json.dumps(collect_run_metadata(manifest), ensure_ascii=False, indent=2), encoding="utf-8")
+    destination.write_text(
+        json.dumps(collect_run_metadata(manifest, extra), ensure_ascii=False, indent=2), encoding="utf-8",
+    )
     return destination
-

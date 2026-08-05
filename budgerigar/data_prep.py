@@ -7,7 +7,8 @@ from pathlib import Path
 import re
 import tarfile
 from typing import Iterable
-from urllib.request import urlopen
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 import wave
 
 
@@ -19,7 +20,10 @@ CMU_ARCTIC = {
     "rms": "c6dc11235629c58441c071a7ba8a2d067903dfefbaabc4056d87da35b72ecda4",
     "slt": "7c173297916acf3cc7fcab2713be4c60b27312316765a90934651d367226b4ea",
 }
-CMU_BASE_URL = "https://www.festvox.org/cmu_arctic/packed"
+CMU_BASE_URLS = (
+    "https://www.festvox.org/cmu_arctic/packed",
+    "http://www.festvox.org/cmu_arctic/packed",
+)
 
 
 def stable_split(key: str, validation_percent: int = 5, test_percent: int = 5) -> str:
@@ -65,15 +69,80 @@ def download_cmu_arctic(root: str | Path, speakers: Iterable[str]) -> list[Path]
         archive = root / f"{name}.tar.bz2"
         if not archive.is_file() or _sha256(archive) != CMU_ARCTIC[speaker]:
             archive.unlink(missing_ok=True)
-            with urlopen(f"{CMU_BASE_URL}/{archive.name}") as source, archive.open("wb") as target:
-                while block := source.read(1024 * 1024):
-                    target.write(block)
+            failures: list[str] = []
+            for base_url in CMU_BASE_URLS:
+                url = f"{base_url}/{archive.name}"
+                try:
+                    request = Request(url, headers={"User-Agent": "Budgerigar-Colab/0.1"})
+                    with urlopen(request, timeout=30) as source, archive.open("wb") as target:
+                        while block := source.read(1024 * 1024):
+                            target.write(block)
+                    break
+                except (OSError, URLError) as error:
+                    archive.unlink(missing_ok=True)
+                    failures.append(f"{url}: {error}")
+            else:
+                detail = "\n".join(failures)
+                raise ConnectionError(
+                    "CMU Festvox rejected all download attempts. Use "
+                    "download_cmu_arctic_hf(...) or upload the verified archive manually.\n" + detail
+                )
         digest = _sha256(archive)
         if digest != CMU_ARCTIC[speaker]:
             raise ValueError(f"checksum mismatch for {archive.name}: {digest}")
         _safe_extract(archive, root)
         if not folder.is_dir():
             raise FileNotFoundError(f"archive did not create expected folder {folder}")
+        extracted.append(folder)
+    return extracted
+
+
+def download_cmu_arctic_hf(
+    root: str | Path, speakers: Iterable[str], repository: str = "MikhailT/cmu-arctic",
+) -> list[Path]:
+    """Materialize CMU ARCTIC from a community Hugging Face mirror.
+
+    This is a Colab fallback for when the original Festvox host refuses the
+    connection. The mirror is not the authoritative host, so the resulting
+    files must still pass the manifest/audio audit and its repository revision
+    should be recorded in run metadata.
+    """
+    try:
+        from datasets import Audio, load_dataset
+    except ImportError as error:
+        raise RuntimeError("install the 'data' extra to use the Hugging Face fallback") from error
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    extracted: list[Path] = []
+    for speaker in speakers:
+        if speaker not in CMU_ARCTIC:
+            raise ValueError(f"unsupported speaker {speaker!r}; choose from {sorted(CMU_ARCTIC)}")
+        folder = root / f"cmu_us_{speaker}_arctic"
+        transcript = folder / "etc" / "txt.done.data"
+        if transcript.is_file() and any((folder / "wav").glob("*.wav")):
+            extracted.append(folder)
+            continue
+        dataset = load_dataset(repository, split=speaker, cache_dir=str(root / ".hf_cache"))
+        dataset = dataset.cast_column("audio", Audio(decode=False))
+        (folder / "wav").mkdir(parents=True, exist_ok=True)
+        (folder / "etc").mkdir(parents=True, exist_ok=True)
+        transcript_lines: list[str] = []
+        for index, item in enumerate(dataset):
+            source_name = Path(item.get("file") or item["audio"].get("path") or f"a{index + 1:04d}.wav").stem
+            suffix_match = re.search(r"([ab]\d{4})$", source_name)
+            if suffix_match is None:
+                raise ValueError(f"cannot infer ARCTIC utterance id from {source_name!r}")
+            utterance_id = f"arctic_{suffix_match.group(1)}"
+            payload = item["audio"].get("bytes")
+            if payload is None:
+                source_path = item["audio"].get("path")
+                if not source_path:
+                    raise ValueError(f"mirror row {index} contains neither audio bytes nor path")
+                payload = Path(source_path).read_bytes()
+            (folder / "wav" / f"{utterance_id}.wav").write_bytes(payload)
+            text = str(item["text"]).replace('"', "'")
+            transcript_lines.append(f'( {utterance_id} "{text}" )')
+        transcript.write_text("\n".join(transcript_lines) + "\n", encoding="utf-8")
         extracted.append(folder)
     return extracted
 
@@ -174,12 +243,16 @@ def main() -> int:
     cmu.add_argument("root", type=Path)
     cmu.add_argument("output", type=Path)
     cmu.add_argument("--speakers", nargs="+", default=["bdl", "slt"])
+    cmu.add_argument("--backend", choices=("official", "huggingface"), default="official")
     esd = subparsers.add_parser("esd", help="index an already downloaded official ESD directory")
     esd.add_argument("root", type=Path)
     esd.add_argument("output", type=Path)
     args = parser.parse_args()
     if args.command == "cmu":
-        download_cmu_arctic(args.root, args.speakers)
+        if args.backend == "official":
+            download_cmu_arctic(args.root, args.speakers)
+        else:
+            download_cmu_arctic_hf(args.root, args.speakers)
         rows = build_cmu_manifest(args.root)
     else:
         rows = build_esd_manifest(args.root)
