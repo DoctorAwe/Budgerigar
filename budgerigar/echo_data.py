@@ -57,11 +57,11 @@ def pair_report(pairs):
     }
 
 
-def feature_stats(pairs):
+def feature_stats(pairs, verbose=True):
     torch, _, _ = require_torch()
     paths = sorted({pair.source_feature for pair in pairs} | {pair.target_feature for pair in pairs})
     total = square = None; frames = 0; fingerprint = None
-    for path in paths:
+    for index, path in enumerate(paths, 1):
         payload = torch.load(path, map_location="cpu", weights_only=True)
         mel = payload["log_mel"].double()
         if total is None:
@@ -70,6 +70,8 @@ def feature_stats(pairs):
         fingerprint = fingerprint or payload["config_fingerprint"]
         if fingerprint != payload["config_fingerprint"]:
             raise ValueError("mixed feature fingerprints")
+        if verbose and (index == 1 or index % 100 == 0 or index == len(paths)):
+            print(f"[stats] {index}/{len(paths)} feature files", flush=True)
     mean = total / frames; variance = square / frames - mean.square()
     return {"mean": mean.float(), "std": variance.clamp_min(1e-6).sqrt().float(), "frames": frames, "feature_fingerprint": fingerprint}
 
@@ -77,14 +79,17 @@ def feature_stats(pairs):
 class EchoEpisodeDataset:
     """Input/output timelines; there are no END/START/READ labels."""
 
-    def __init__(self, pairs, stats, thinking_frames=(16, 28), preload=True):
+    def __init__(self, pairs, stats, thinking_frames=(16, 28), preload=True, verbose=True):
         if thinking_frames[0] < 0 or thinking_frames[1] < thinking_frames[0]:
             raise ValueError("thinking_frames must be a non-negative (minimum, maximum) pair")
         self.pairs = list(pairs); self.stats = stats; self.thinking_frames = thinking_frames; self.cache = {}
         if preload:
             torch, _, _ = require_torch()
-            for path in sorted({p.source_feature for p in self.pairs} | {p.target_feature for p in self.pairs}):
+            paths = sorted({p.source_feature for p in self.pairs} | {p.target_feature for p in self.pairs})
+            for index, path in enumerate(paths, 1):
                 self.cache[path] = torch.load(path, map_location="cpu", weights_only=True)
+                if verbose and (index == 1 or index % 100 == 0 or index == len(paths)):
+                    print(f"[preload] {index}/{len(paths)} feature files", flush=True)
 
     def __len__(self): return len(self.pairs)
 

@@ -21,16 +21,33 @@ class EchoTrainingConfig:
     thinking_frames_min: int = 16
     thinking_frames_max: int = 28
     gradient_clip: float = 1.0
+    max_train_pairs: int | None = 256
+    max_validation_pairs: int | None = 64
 
 
-def train_neural_echo(feature_manifest, output_dir, training=EchoTrainingConfig(), model_config=NeuralEchoConfig()):
+def train_neural_echo(
+    feature_manifest, output_dir, training=EchoTrainingConfig(),
+    model_config=NeuralEchoConfig(), stats=None,
+):
     torch, _, functional = require_torch(); torch.manual_seed(training.seed); random.seed(training.seed)
     pairs = load_pairs(feature_manifest, training.target_speaker)
     train_pairs = [p for p in pairs if p.split == "train"]; validation_pairs = [p for p in pairs if p.split == "validation"]
+    if training.max_train_pairs is not None:
+        train_pairs = train_pairs[:training.max_train_pairs]
+    if training.max_validation_pairs is not None:
+        validation_pairs = validation_pairs[:training.max_validation_pairs]
     if not train_pairs or not validation_pairs: raise ValueError("non-empty train and validation pairs are required")
-    stats = feature_stats(train_pairs)
+    print("[prepare] all pairs:", pair_report(pairs), flush=True)
+    print(f"[prepare] smoke subset: train={len(train_pairs)}, validation={len(validation_pairs)}", flush=True)
+    if stats is None:
+        print("[prepare] computing feature statistics", flush=True)
+        stats = feature_stats(train_pairs)
+    else:
+        print("[prepare] reusing feature statistics from the notebook", flush=True)
     thinking_frames = (training.thinking_frames_min, training.thinking_frames_max)
+    print("[prepare] preloading train features from Drive", flush=True)
     train_set = EchoEpisodeDataset(train_pairs, stats, thinking_frames, preload=True)
+    print("[prepare] preloading validation features from Drive", flush=True)
     validation_set = EchoEpisodeDataset(validation_pairs, stats, thinking_frames, preload=True)
     loader = torch.utils.data.DataLoader
     train_loader = loader(train_set, batch_size=training.batch_size, shuffle=True, num_workers=0, collate_fn=collate_episodes)
@@ -39,6 +56,7 @@ def train_neural_echo(feature_manifest, output_dir, training=EchoTrainingConfig(
     optimizer = torch.optim.AdamW(model.parameters(), lr=training.learning_rate, weight_decay=1e-4)
     output_dir = Path(output_dir); output_dir.mkdir(parents=True, exist_ok=True)
     history = []; best = float("inf"); step = 0
+    print(f"[train] device={device}, max_steps={training.max_steps}", flush=True)
     for epoch in range(training.epochs):
         model.train(); total = count = 0
         for inputs, targets, voice, valid, _ in train_loader:
@@ -49,6 +67,8 @@ def train_neural_echo(feature_manifest, output_dir, training=EchoTrainingConfig(
             loss = acoustic + 0.25 * confidence
             optimizer.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), training.gradient_clip); optimizer.step()
             frames = int(valid.sum()); total += float(loss) * frames; count += frames; step += 1
+            if step == 1 or step % 25 == 0:
+                print(f"[train] step={step} loss={float(loss):.5f}", flush=True)
             if training.max_steps and step >= training.max_steps: break
         model.eval(); validation_total = validation_count = 0
         with torch.no_grad():
@@ -60,11 +80,12 @@ def train_neural_echo(feature_manifest, output_dir, training=EchoTrainingConfig(
                 frames = int(valid.sum()); validation_total += float(loss) * frames; validation_count += frames
         metrics = {"epoch": epoch + 1, "step": step, "train_loss": total / count, "validation_loss": validation_total / validation_count}
         history.append(metrics); print(json.dumps(metrics))
-        checkpoint = {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "stats": stats, "model_config": asdict(model_config), "training_config": asdict(training), "pairs": pair_report(pairs), "history": history}
+        subset = {"train": len(train_pairs), "validation": len(validation_pairs)}
+        checkpoint = {"model": model.state_dict(), "optimizer": optimizer.state_dict(), "stats": stats, "model_config": asdict(model_config), "training_config": asdict(training), "pairs": pair_report(pairs), "training_subset": subset, "history": history}
         torch.save(checkpoint, output_dir / "last.pt")
         if metrics["validation_loss"] < best: best = metrics["validation_loss"]; torch.save(checkpoint, output_dir / "best.pt")
         if training.max_steps and step >= training.max_steps: break
-    report = {"behavior": "continuous_neural_listen_then_repeat", "device": str(device), "steps": step, "best_validation_loss": best, "pairs": pair_report(pairs), "history": history}
+    report = {"behavior": "continuous_neural_listen_then_repeat", "device": str(device), "steps": step, "best_validation_loss": best, "pairs": pair_report(pairs), "training_subset": {"train": len(train_pairs), "validation": len(validation_pairs)}, "history": history}
     (output_dir / "training_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report
 
