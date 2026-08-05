@@ -12,6 +12,7 @@ dependencies = ["torch>=2.2", "torchaudio>=2.2"]
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 demo = ["gradio>=5.0", "matplotlib>=3.8"]
+data = ["librosa>=0.10", "soundfile>=0.12"]
 
 [tool.setuptools.packages.find]
 include = ["budgerigar*"]

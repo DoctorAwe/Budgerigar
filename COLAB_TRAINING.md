@@ -312,3 +312,70 @@ drive.mount('/content/drive')
 - 查看推理时间、实时率和流式块数。
 
 Colab 单元格会持续运行以维持 Web 服务。停止单元格或断开运行时后，临时公网链接会失效。不要公开分享包含私人录音或敏感 checkpoint 的演示链接。
+
+## 9. 第二阶段：DTW 对齐与离线缓存
+
+当无对齐基线已经能听出词语、但失真明显且 loss 长期停在同一区间时，停止继续堆训练步数。先保存基线：
+
+```bash
+!cp checkpoints/budgerigar.pt checkpoints/budgerigar_no_dtw.pt
+!pip install -q -r requirements-data.txt
+```
+
+为训练集和验证集提取 Log-Mel，并对每一组同句真人录音执行局部 DTW 对齐：
+
+```bash
+!python -m budgerigar.prepare_features \
+  --manifest data/arctic/train.jsonl \
+  --output data/arctic_dtw \
+  --workers 2 \
+  --band-radius 0.25
+
+!python -m budgerigar.prepare_features \
+  --manifest data/arctic/validation.jsonl \
+  --output data/arctic_dtw \
+  --workers 2 \
+  --band-radius 0.25
+```
+
+处理结果包含缓存 Mel 和新 manifest：
+
+```text
+data/arctic_dtw/features/*.pt
+data/arctic_dtw/train.jsonl
+data/arctic_dtw/validation.jsonl
+```
+
+该步骤只需执行一次。重复运行会复用已有 `.pt` 文件。DTW 是 CPU 任务，运行时可以暂时切换为 CPU，避免消耗 Colab GPU 配额。处理完成后建议把整个 `data/arctic_dtw` 保存到 Google Drive。
+
+重新启用 GPU，训练第二阶段模型。DTW 改变了监督目标，建议从新模型开始训练，而不是继续加载无对齐 checkpoint：
+
+```bash
+!python -m budgerigar.train \
+  --manifest data/arctic_dtw/train.jsonl \
+  --steps 10000 \
+  --batch-size 4 \
+  --segment-frames 320 \
+  --token-dim 192 \
+  --checkpoint checkpoints/budgerigar_dtw.pt \
+  --device cuda
+```
+
+在 2000、5000 和 10000 steps 分别评估：
+
+```bash
+!python -m budgerigar.evaluate \
+  --manifest data/arctic_dtw/validation.jsonl \
+  --checkpoint checkpoints/budgerigar_dtw.pt \
+  --device cuda
+```
+
+新评估会输出：
+
+- `mel_mae`：模型与 DTW 目标的平均误差；
+- `copy_source_mel_mae`：直接复制输入的基线；
+- `relative_improvement_over_copy`：模型相对复制基线的改善率；
+- `dynamic_range_ratio`：输出动态范围与目标的比例，过低意味着输出过度平滑；
+- `chunk_max_error`：整段与流式分块的一致性。
+
+建议以“验证 MAE 下降、改善率提高、动态范围接近 1”共同选择 checkpoint，而不是只看训练 loss。
