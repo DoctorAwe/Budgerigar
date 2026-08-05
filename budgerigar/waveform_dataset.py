@@ -18,8 +18,15 @@ class WaveformStreamDataset(Dataset):
         sample_rate: int = 16_000, hop_samples: int = 160,
         gap_ms: tuple[int, int] = (0, 800), seed: int = 29,
     ):
+        manifest = Path(manifest)
+        if not manifest.exists():
+            raise FileNotFoundError(
+                f"Multi-target manifest not found: {manifest}. Generate it with: "
+                "python -m budgerigar.prepare_arctic --root /content/data/cmu_arctic "
+                "--output data/arctic_multi --all-targets"
+            )
         self.rows = [
-            json.loads(line) for line in Path(manifest).read_text(encoding="utf-8").splitlines()
+            json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
         if not self.rows:
@@ -101,4 +108,3 @@ def collate_waveform(batch):
         "completion_samples": [item["completion_samples"] for item in batch],
         "output_start_samples": [item["output_start_samples"] for item in batch],
     }
-
