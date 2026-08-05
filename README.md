@@ -25,6 +25,8 @@ budgerigar-audit data/manifest.jsonl
 
 推进状态见 [docs/09_实施进度.md](docs/09_实施进度.md)。
 
+Colab 数据入口：[notebooks/Budgerigar_Data.ipynb](notebooks/Budgerigar_Data.ipynb)。它会下载并校验 CMU ARCTIC、索引用户已按官方研究条款取得的 ESD、运行真实 manifest 审计并保存运行元数据。
+
 ## 文档导航
 
 1. [阶段 0：问题定义与验收标准](docs/01_阶段0_问题定义.md)

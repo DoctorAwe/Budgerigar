@@ -16,10 +16,10 @@ demo = ["gradio>=5"]
 
 [project.scripts]
 budgerigar-audit = "budgerigar.manifest:main"
+budgerigar-prepare = "budgerigar.data_prep:main"
 
 [tool.setuptools.packages.find]
 include = ["budgerigar*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
