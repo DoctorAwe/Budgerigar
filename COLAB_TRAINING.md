@@ -281,3 +281,31 @@ drive.mount('/content/drive')
 ```
 
 该命令用 Griffin-Lim 产生诊断音频，音质不会代表最终模型。确认内容学习有效后，再接入训练好的流式 HiFi-GAN/Vocos 声码器。
+
+## 8. 启动 Web 可视化演示
+
+先安装演示依赖：
+
+```bash
+!pip install -q -r requirements-demo.txt
+```
+
+然后启动 Gradio。`--share` 会生成一个临时公网链接，可在电脑或手机浏览器中打开：
+
+```bash
+!python -m budgerigar.web_demo \
+  --checkpoint checkpoints/budgerigar.pt \
+  --device cuda \
+  --share
+```
+
+页面支持：
+
+- 上传 WAV/MP3 或直接使用麦克风录音；
+- 调整 80～1000 ms 流式分块；
+- 试听模型复述结果；
+- 对比输入和输出 Log-Mel 频谱；
+- 观察 16 层因果管线的状态能量；
+- 查看推理时间、实时率和流式块数。
+
+Colab 单元格会持续运行以维持 Web 服务。停止单元格或断开运行时后，临时公网链接会失效。不要公开分享包含私人录音或敏感 checkpoint 的演示链接。

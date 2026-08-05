@@ -11,10 +11,10 @@ dependencies = ["torch>=2.2", "torchaudio>=2.2"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+demo = ["gradio>=5.0", "matplotlib>=3.8"]
 
 [tool.setuptools.packages.find]
 include = ["budgerigar*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
