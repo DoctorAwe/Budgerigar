@@ -85,6 +85,8 @@ def train_content_memory(
         if normalized_resume_config != asdict(model_config):
             raise ValueError("resume model configuration does not match the current configuration")
         model.load_state_dict(resume["model"]); optimizer.load_state_dict(resume["optimizer"])
+        for group in optimizer.param_groups:
+            group["lr"] = training.learning_rate
         for state in optimizer.state.values():
             for key, value in state.items():
                 if torch.is_tensor(value): state[key] = value.to(device)
