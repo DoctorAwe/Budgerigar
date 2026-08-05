@@ -295,6 +295,8 @@ drive.mount('/content/drive')
 ```bash
 !python -m budgerigar.web_demo \
   --checkpoint checkpoints/budgerigar.pt \
+  --manifest data/arctic/validation.jsonl \
+  --max-examples 24 \
   --device cuda \
   --share
 ```
@@ -302,6 +304,7 @@ drive.mount('/content/drive')
 页面支持：
 
 - 上传 WAV/MP3 或直接使用麦克风录音；
+- 从验证集选择未参与训练的源真人语音，并试听对应目标真人参考；
 - 调整 80～1000 ms 流式分块；
 - 试听模型复述结果；
 - 对比输入和输出 Log-Mel 频谱；

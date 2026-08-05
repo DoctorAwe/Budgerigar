@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from functools import lru_cache
+import json
 from pathlib import Path
 import tempfile
 import time
@@ -92,8 +93,38 @@ def convert(audio_path: str | None, checkpoint_path: str, chunk_ms: int, device_
     return str(output_path), visualization(features.cpu(), prediction, state_energy), metrics
 
 
-def build_app(default_checkpoint: str, default_device: str):
+def validation_examples(manifest_path: str, limit: int) -> dict[str, dict[str, str]]:
+    manifest = Path(manifest_path)
+    if not manifest.exists():
+        return {}
+    rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip()]
+    examples = {}
+    for row in rows[:limit]:
+        label = f'{row["source_speaker"]} → {row["target_speaker"]} · {row["utterance_id"]}'
+        examples[label] = row
+    return examples
+
+
+def build_app(
+    default_checkpoint: str,
+    default_device: str,
+    validation_manifest: str = "data/arctic/validation.jsonl",
+    max_examples: int = 24,
+):
     import gradio as gr
+
+    examples = validation_examples(validation_manifest, max_examples)
+
+    def select_example(label: str):
+        if not label or label not in examples:
+            raise ValueError("请选择一个验证集样本")
+        row = examples[label]
+        description = (
+            f'验证样本：**{row["utterance_id"]}**　'
+            f'输入说话人：**{row["source_speaker"]}**　'
+            f'目标说话人：**{row["target_speaker"]}**'
+        )
+        return row["source_path"], row["target_path"], description
 
     with gr.Blocks(title="Budgerigar 鹦鹉学舌演示", theme=gr.themes.Soft()) as app:
         gr.Markdown(
@@ -102,6 +133,14 @@ def build_app(default_checkpoint: str, default_device: str):
         )
         with gr.Row():
             with gr.Column(scale=1):
+                if examples:
+                    with gr.Group():
+                        example = gr.Dropdown(
+                            choices=list(examples), label="数据集验证样本",
+                            info="选择一条未参与训练的源真人语音",
+                        )
+                        load_example = gr.Button("载入验证样本")
+                        example_info = gr.Markdown("从验证集选择样本，或在下方上传自己的录音。")
                 audio_input = gr.Audio(
                     label="输入真人语音", sources=["upload", "microphone"], type="filepath"
                 )
@@ -112,6 +151,7 @@ def build_app(default_checkpoint: str, default_device: str):
                 run = gr.Button("开始模仿", variant="primary")
                 gr.Markdown("提示：当前使用 Griffin-Lim 诊断声码器，金属感来自声码器，不完全代表模型能力。")
             with gr.Column(scale=1):
+                target_reference = gr.Audio(label="目标真人参考（验证集）", interactive=False)
                 audio_output = gr.Audio(label="模型复述输出")
                 metrics = gr.Markdown("等待输入…")
         plot = gr.Plot(label="声学与状态可视化")
@@ -120,6 +160,12 @@ def build_app(default_checkpoint: str, default_device: str):
             inputs=[audio_input, checkpoint, chunk_ms, device],
             outputs=[audio_output, plot, metrics],
         )
+        if examples:
+            load_example.click(
+                fn=select_example,
+                inputs=[example],
+                outputs=[audio_input, target_reference, example_info],
+            )
     return app
 
 
@@ -127,11 +173,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Launch the Budgerigar Gradio demo")
     parser.add_argument("--checkpoint", default="checkpoints/budgerigar.pt")
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument("--manifest", default="data/arctic/validation.jsonl")
+    parser.add_argument("--max-examples", type=int, default=24)
     parser.add_argument("--share", action="store_true", help="Create a temporary public Gradio URL")
     parser.add_argument("--port", type=int, default=7860)
     args = parser.parse_args()
-    app = build_app(args.checkpoint, args.device)
-    app.launch(server_name="0.0.0.0", server_port=args.port, share=args.share, show_error=True)
+    app = build_app(args.checkpoint, args.device, args.manifest, args.max_examples)
+    allowed_paths = [str(Path(args.manifest).expanduser().resolve().parent)]
+    examples = validation_examples(args.manifest, args.max_examples)
+    for row in examples.values():
+        allowed_paths.extend([str(Path(row["source_path"]).parent), str(Path(row["target_path"]).parent)])
+    app.launch(
+        server_name="0.0.0.0", server_port=args.port, share=args.share,
+        show_error=True, allowed_paths=sorted(set(allowed_paths)),
+    )
 
 
 if __name__ == "__main__":
