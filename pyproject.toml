@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "budgerigar"
+version = "0.1.0"
+description = "Causal streaming listen-and-repeat speech model"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.2", "torchaudio>=2.2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["budgerigar*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
