@@ -73,7 +73,7 @@ def convert(audio_path: str | None, checkpoint_path: str, chunk_ms: int, device_
     inference_seconds = time.perf_counter() - started
 
     prediction = torch.cat(outputs)
-    generated = approximate_waveform(prediction, audio)
+    generated = approximate_waveform(prediction, audio, phase_reference=waveform)
     output_dir = Path(tempfile.mkdtemp(prefix="budgerigar_demo_"))
     output_path = output_dir / "budgerigar_output.wav"
     import torchaudio
@@ -149,7 +149,7 @@ def build_app(
                     chunk_ms = gr.Slider(80, 1000, value=320, step=40, label="流式分块（ms）")
                     device = gr.Dropdown(["auto", "cuda", "cpu"], value=default_device, label="设备")
                 run = gr.Button("开始模仿", variant="primary")
-                gr.Markdown("提示：当前使用 Griffin-Lim 诊断声码器，金属感来自声码器，不完全代表模型能力。")
+                gr.Markdown("提示：当前使用输入相位辅助诊断合成；可懂度可用于检查模型，但最终音色仍需神经声码器。")
             with gr.Column(scale=1):
                 target_reference = gr.Audio(label="目标真人参考（验证集）", interactive=False)
                 audio_output = gr.Audio(label="模型复述输出")

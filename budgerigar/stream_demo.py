@@ -10,8 +10,12 @@ from .model import BudgerigarConfig, BudgerigarModel
 from .train import choose_device
 
 
-def approximate_waveform(log_mel_features: torch.Tensor, audio: AudioConfig) -> torch.Tensor:
-    """Diagnostic inversion only; replace with a trained neural vocoder for quality."""
+def approximate_waveform(
+    log_mel_features: torch.Tensor,
+    audio: AudioConfig,
+    phase_reference: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Diagnostic inversion; source phase is preferable to random Griffin-Lim phase."""
     try:
         import torchaudio
     except ImportError as error:
@@ -23,6 +27,23 @@ def approximate_waveform(log_mel_features: torch.Tensor, audio: AudioConfig) -> 
     filters = mel_filterbank(audio, device="cpu", dtype=torch.float32)
     inverse_filters = torch.linalg.pinv(filters, rtol=1e-4)
     spectrum = (inverse_filters @ mel_power).clamp_min(1e-8).sqrt()
+    if phase_reference is not None:
+        reference = phase_reference.detach().float().cpu()
+        window = torch.hann_window(audio.win_length)
+        reference_spectrum = torch.stft(
+            reference, audio.n_fft, audio.hop_length, audio.win_length,
+            window, return_complex=True, center=True,
+        )
+        frames = min(spectrum.shape[-1], reference_spectrum.shape[-1])
+        magnitude = spectrum[:, :frames]
+        phase = torch.angle(reference_spectrum[:, :frames])
+        complex_spectrum = torch.polar(magnitude, phase)
+        waveform = torch.istft(
+            complex_spectrum, audio.n_fft, audio.hop_length, audio.win_length,
+            window, center=True, length=reference.numel(),
+        )
+        peak = waveform.abs().max().clamp_min(1e-6)
+        return waveform * (0.95 / peak).clamp_max(1.0)
     return torchaudio.transforms.GriffinLim(
         n_fft=audio.n_fft, hop_length=audio.hop_length, win_length=audio.win_length,
     )(spectrum)
@@ -49,7 +70,7 @@ def main() -> None:
     for start in range(0, len(features), chunk_frames):
         prediction, state = model.forward_chunk(features[None, start:start + chunk_frames], state)
         output.append(prediction[0].cpu())
-    waveform = approximate_waveform(torch.cat(output), audio)
+    waveform = approximate_waveform(torch.cat(output), audio, phase_reference=load_wave(args.input, audio.sample_rate))
     import torchaudio
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torchaudio.save(str(args.output), waveform[None], audio.sample_rate)

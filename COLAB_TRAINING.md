@@ -280,7 +280,7 @@ drive.mount('/content/drive')
   --device cuda
 ```
 
-该命令用 Griffin-Lim 产生诊断音频，音质不会代表最终模型。确认内容学习有效后，再接入训练好的流式 HiFi-GAN/Vocos 声码器。
+该命令使用输入语音相位辅助重建诊断音频，通常比 Griffin-Lim 随机相位更可懂，但会保留部分输入说话人的相位特征，不能代表最终目标音色。确认内容学习有效后，再接入与训练特征严格匹配的流式 HiFi-GAN/Vocos 声码器。
 
 ## 8. 启动 Web 可视化演示
 
