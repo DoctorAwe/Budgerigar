@@ -77,7 +77,10 @@ def create_codec_copy_model(config=CodecCopyConfig()):
                 decoded=torch.cat([decoder,context],-1)
                 step_logits=torch.stack([head(decoded) for head in self.output_heads],1)
                 logits.append(step_logits); voices.append(self.voice_head(decoded).squeeze(-1)); attention_history.append(attention)
-                predicted=torch.stack([table(step_logits[:,book].softmax(-1)) for book,table in enumerate(self.output_embeddings)],0).mean(0)
+                predicted=torch.stack([
+                    step_logits[:,book].softmax(-1) @ table.weight
+                    for book,table in enumerate(self.output_embeddings)
+                ],0).mean(0)
                 previous=predicted
                 if teacher_embedded is not None and tick+1<ticks and teacher_ratio>0:
                     use_teacher=(torch.rand(batch,device=inputs.device)<teacher_ratio)&teacher_valid[:,tick]
