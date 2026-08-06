@@ -23,6 +23,7 @@ class DualPathTrainingConfig:
     thinking_frames_max: int = 28
     contrastive_weight: float = 0.5
     gradient_clip: float = 1.0
+    clock_weight: float = 0.0
     seed: int = 41
     initialization_checkpoint: str | None = None
 
@@ -54,15 +55,25 @@ def train_dual_path_echo(feature_manifest, output_dir, training=DualPathTraining
         model.train(); total = count = 0
         for inputs, targets, voice, valid, metadata in train_loader:
             inputs, targets, voice, valid = inputs.to(device), targets.to(device), voice.to(device), valid.to(device)
-            predicted, voice_logits, _, _ = model(inputs)
+            predicted, voice_logits, _, diagnostics = model(inputs)
             frame_l1 = (predicted - targets).abs().mean(-1)
             acoustic = (frame_l1 * (1 + 3 * voice))[valid].mean()
             confidence = functional.binary_cross_entropy_with_logits(voice_logits[valid], voice[valid])
             contrastive = sequence_contrastive_loss(predicted, targets, voice, metadata, functional)
-            loss = acoustic + 0.25 * confidence + training.contrastive_weight * contrastive
+            clock = predicted.new_zeros(())
+            if "write_phase" in diagnostics:
+                slots = float(getattr(model_config, "event_slots", 1))
+                write_target = inputs[..., -1].cumsum(1) / max(float(getattr(model_config, "update_stride", 1)), 1.0)
+                write_target = write_target.clamp(max=slots - 1)
+                final_write = diagnostics["write_phase"][:, -1].detach().unsqueeze(1)
+                voiced_progress = voice.cumsum(1) / voice.sum(1, keepdim=True).clamp_min(1.0)
+                read_target = voiced_progress * final_write
+                clock = (functional.smooth_l1_loss(diagnostics["write_phase"][valid] / slots, write_target[valid] / slots)
+                         + functional.smooth_l1_loss(diagnostics["read_phase"][valid] / slots, read_target[valid] / slots))
+            loss = acoustic + 0.25 * confidence + training.contrastive_weight * contrastive + training.clock_weight * clock
             optimizer.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), training.gradient_clip); optimizer.step()
             step += 1; total += float(loss); count += 1
-            if step == 1 or step % 10 == 0: print(f"[dual train] step={step} loss={float(loss):.4f} acoustic={float(acoustic):.4f} contrastive={float(contrastive):.4f}", flush=True)
+            if step == 1 or step % 10 == 0: print(f"[dual train] step={step} loss={float(loss):.4f} acoustic={float(acoustic):.4f} contrastive={float(contrastive):.4f} clock={float(clock):.4f}", flush=True)
             if step >= training.max_steps: break
         model.eval(); full_l1 = local_l1 = abstract_l1 = batches = 0
         with torch.no_grad():
