@@ -25,6 +25,7 @@ class DualPathTrainingConfig:
     gradient_clip: float = 1.0
     clock_weight: float = 0.0
     teacher_forcing_ratio: float = 0.0
+    teacher_forcing_final: float | None = None
     seed: int = 41
     initialization_checkpoint: str | None = None
 
@@ -57,7 +58,10 @@ def train_dual_path_echo(feature_manifest, output_dir, training=DualPathTraining
         for inputs, targets, voice, valid, metadata in train_loader:
             inputs, targets, voice, valid = inputs.to(device), targets.to(device), voice.to(device), valid.to(device)
             if getattr(model_config, "output_feedback", False):
-                predicted, voice_logits, _, diagnostics = model(inputs, teacher_mel=targets, teacher_forcing_ratio=training.teacher_forcing_ratio)
+                final_ratio = training.teacher_forcing_ratio if training.teacher_forcing_final is None else training.teacher_forcing_final
+                progress = min(step / max(training.max_steps - 1, 1), 1.0)
+                teacher_ratio = training.teacher_forcing_ratio + progress * (final_ratio - training.teacher_forcing_ratio)
+                predicted, voice_logits, _, diagnostics = model(inputs, teacher_mel=targets, teacher_forcing_ratio=teacher_ratio)
             else:
                 predicted, voice_logits, _, diagnostics = model(inputs)
             frame_l1 = (predicted - targets).abs().mean(-1)
@@ -77,7 +81,9 @@ def train_dual_path_echo(feature_manifest, output_dir, training=DualPathTraining
             loss = acoustic + 0.25 * confidence + training.contrastive_weight * contrastive + training.clock_weight * clock
             optimizer.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), training.gradient_clip); optimizer.step()
             step += 1; total += float(loss); count += 1
-            if step == 1 or step % 10 == 0: print(f"[dual train] step={step} loss={float(loss):.4f} acoustic={float(acoustic):.4f} contrastive={float(contrastive):.4f} clock={float(clock):.4f}", flush=True)
+            if step == 1 or step % 10 == 0:
+                ratio = teacher_ratio if getattr(model_config, "output_feedback", False) else 0.0
+                print(f"[dual train] step={step} loss={float(loss):.4f} acoustic={float(acoustic):.4f} contrastive={float(contrastive):.4f} clock={float(clock):.4f} teacher={ratio:.3f}", flush=True)
             if step >= training.max_steps: break
         model.eval(); full_l1 = local_l1 = abstract_l1 = batches = 0
         with torch.no_grad():
