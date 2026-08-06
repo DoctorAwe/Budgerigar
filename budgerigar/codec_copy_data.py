@@ -46,12 +46,19 @@ class CodecCopyEpisodeDataset:
         return inputs,targets,voice,metadata
 
 
-def audit_codec_copy_manifest(codec_manifest):
+def audit_codec_copy_manifest(codec_manifest, sample_payloads=64):
     torch,_,_=require_torch(); rows=[json.loads(x) for x in Path(codec_manifest).read_text(encoding="utf-8").splitlines() if x.strip()]
+    manifest_fingerprints={row.get("codec_fingerprint") for row in rows}
+    required=("id","codec_path","codec_frames","codec_fingerprint","split")
+    missing=sum(any(key not in row for key in required) for row in rows)
+    count=min(sample_payloads,len(rows)); indices=sorted({round(i*(len(rows)-1)/max(count-1,1)) for i in range(count)})
     shapes=set(); rates=[]; fingerprints=set(); code_min=None; code_max=None
-    for row in rows:
+    for progress,index in enumerate(indices,1):
+        row=rows[index]
         payload=torch.load(row["codec_path"],map_location="cpu",weights_only=True); codes=normalize_audio_codes(payload["audio_codes"])
         shapes.add(codes.shape[1]); rates.append(len(codes)/(payload["audio_length"]/payload["sample_rate"])); fingerprints.add(payload["codec_fingerprint"])
         value_min=int(codes.min()); value_max=int(codes.max()); code_min=value_min if code_min is None else min(code_min,value_min); code_max=value_max if code_max is None else max(code_max,value_max)
-    return {"records":len(rows),"codebooks":sorted(shapes),"frame_rate_min":min(rates),"frame_rate_max":max(rates),
-            "token_min":code_min,"token_max":code_max,"fingerprints":sorted(fingerprints)}
+        if progress==1 or progress%16==0 or progress==len(indices): print(f"[codec audit] {progress}/{len(indices)} sampled payloads",flush=True)
+    return {"records":len(rows),"manifest_missing_required":missing,"manifest_fingerprints":sorted(str(value) for value in manifest_fingerprints),
+            "sampled_payloads":len(indices),"codebooks":sorted(shapes),"frame_rate_min":min(rates),"frame_rate_max":max(rates),
+            "token_min":code_min,"token_max":code_max,"payload_fingerprints":sorted(fingerprints)}
