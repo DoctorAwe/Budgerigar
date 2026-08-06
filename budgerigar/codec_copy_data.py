@@ -62,3 +62,12 @@ def audit_codec_copy_manifest(codec_manifest, sample_payloads=64):
     return {"records":len(rows),"manifest_missing_required":missing,"manifest_fingerprints":sorted(str(value) for value in manifest_fingerprints),
             "sampled_payloads":len(indices),"codebooks":sorted(shapes),"frame_rate_min":min(rates),"frame_rate_max":max(rates),
             "token_min":code_min,"token_max":code_max,"payload_fingerprints":sorted(fingerprints)}
+
+
+def collate_codec_copy(batch):
+    torch,_,_=require_torch(); frames=max(len(item[0]) for item in batch); books=batch[0][0].shape[1]
+    inputs=torch.full((len(batch),frames,books),-1,dtype=torch.long)
+    targets=torch.full((len(batch),frames,books),-100,dtype=torch.long); voice=torch.zeros(len(batch),frames); valid=torch.zeros(len(batch),frames,dtype=torch.bool)
+    for index,(x,y,v,_) in enumerate(batch):
+        inputs[index,:len(x)]=x; targets[index,:len(y)]=y; voice[index,:len(v)]=v; valid[index,:len(x)]=True
+    return inputs,targets,voice,valid,[item[3] for item in batch]
