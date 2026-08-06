@@ -7,86 +7,83 @@ from .neural_echo import require_torch
 class CodecCopyConfig:
     codebooks:int=8
     vocabulary_size:int=1024
-    hidden_dim:int=192
+    hidden_dim:int=256
     understanding_layers:int=4
-    attention_heads:int=4
-    read_sigma:float=0.65
-    direct_tape_logits:bool=False
-    exact_address_replay:bool=False
-    maximum_rate_correction:float=0.05
+    dropout:float=0.1
 
 
 def create_codec_copy_model(config=CodecCopyConfig()):
-    torch,nn,functional=require_torch(); dim=config.hidden_dim
+    """A fully learned streaming listen-then-repeat network.
+
+    The model never indexes or returns an input codec token.  Past audio is represented
+    only by learned recurrent activations.  A decoder uses soft attention over those
+    activations and its own previous acoustic output to generate every codec token.
+    """
+    torch,nn,_=require_torch(); dim=config.hidden_dim
+
     class CodecCopyModel(nn.Module):
         def __init__(self):
             super().__init__(); self.config=config
-            self.embeddings=nn.ModuleList([nn.Embedding(config.vocabulary_size,dim) for _ in range(config.codebooks)])
-            self.silence=nn.Parameter(torch.zeros(dim)); self.layer_embedding=nn.Parameter(torch.randn(config.understanding_layers,dim)*.02)
-            self.layer_attention=nn.ModuleList([nn.MultiheadAttention(dim,config.attention_heads,batch_first=True) for _ in range(config.understanding_layers)])
-            self.optimizers=nn.ModuleList([nn.GRUCell(dim*2,dim) for _ in range(config.understanding_layers)])
-            self.controller=nn.GRUCell(dim*3,dim)
-            self.readiness=nn.Sequential(nn.LayerNorm(dim*2),nn.Linear(dim*2,1))
-            self.advance=nn.Sequential(nn.LayerNorm(dim*3),nn.Linear(dim*3,1),nn.Softplus())
-            self.voice_head=nn.Sequential(nn.LayerNorm(dim*3),nn.Linear(dim*3,1))
-            self.rate_head=nn.Sequential(nn.LayerNorm(dim*3),nn.Linear(dim*3,1))
-            self.output_heads=None if (config.direct_tape_logits or config.exact_address_replay) else nn.ModuleList([nn.Linear(dim*3,config.vocabulary_size) for _ in range(config.codebooks)])
+            self.input_embeddings=nn.ModuleList([nn.Embedding(config.vocabulary_size,dim) for _ in range(config.codebooks)])
+            self.output_embeddings=nn.ModuleList([nn.Embedding(config.vocabulary_size,dim) for _ in range(config.codebooks)])
+            self.no_audio=nn.Parameter(torch.zeros(dim)); self.no_output=nn.Parameter(torch.zeros(dim))
+            self.encoder_cells=nn.ModuleList([nn.GRUCell(dim,dim) for _ in range(config.understanding_layers)])
+            self.encoder_norms=nn.ModuleList([nn.LayerNorm(dim) for _ in range(config.understanding_layers)])
+            self.memory_keys=nn.Linear(dim,dim,bias=False); self.memory_values=nn.Linear(dim,dim,bias=False)
+            self.decoder=nn.GRUCell(dim*3,dim)
+            self.query=nn.Linear(dim,dim,bias=False)
+            self.voice_head=nn.Sequential(nn.LayerNorm(dim*2),nn.Linear(dim*2,1))
+            self.output_heads=nn.ModuleList([nn.Sequential(nn.LayerNorm(dim*2),nn.Linear(dim*2,config.vocabulary_size)) for _ in range(config.codebooks)])
+            self.dropout=nn.Dropout(config.dropout)
 
-        def _embed(self,codes):
-            valid=codes.ge(0); clamped=codes.clamp_min(0)
-            parts=[embedding(clamped[...,index])*valid[...,index:index+1] for index,embedding in enumerate(self.embeddings)]
-            return sum(parts)/valid.sum(-1,keepdim=True).clamp_min(1),valid.any(-1)
+        @staticmethod
+        def _masked_mean(parts,valid):
+            return sum(parts)/valid.sum(-1,keepdim=True).clamp_min(1)
 
-        def forward(self,inputs,ablate_tape=False,ablate_understanding=False):
-            embedded,input_valid=self._embed(inputs); batch,ticks,_=embedded.shape
-            positions=torch.arange(ticks,device=inputs.device,dtype=embedded.dtype)
-            layers=[embedded.new_zeros(batch,dim) for _ in range(config.understanding_layers)]
-            controller=embedded.new_zeros(batch,dim); read_phase=embedded.new_zeros(batch)
-            logits=[]; voices=[]; phases=[]; readiness_history=[]; advances=[]; addresses=[]
-            visible=input_valid.cumsum(1)
+        def _input_embedding(self,codes):
+            valid=codes.ge(0); safe=codes.clamp_min(0)
+            parts=[table(safe[...,book])*valid[...,book:book+1] for book,table in enumerate(self.input_embeddings)]
+            return self._masked_mean(parts,valid),valid.any(-1)
+
+        def _output_embedding(self,codes):
+            valid=codes.ge(0); safe=codes.clamp_min(0)
+            parts=[table(safe[...,book])*valid[...,book:book+1] for book,table in enumerate(self.output_embeddings)]
+            return self._masked_mean(parts,valid),valid.any(-1)
+
+        def forward(self,inputs,teacher_tokens=None,teacher_ratio=0.0):
+            encoded,input_valid=self._input_embedding(inputs); batch,ticks,_=encoded.shape
+            states=[encoded.new_zeros(batch,dim) for _ in range(config.understanding_layers)]
+            memories=[]
             for tick in range(ticks):
-                current=torch.where(input_valid[:,tick:tick+1],embedded[:,tick],self.silence.unsqueeze(0))
-                previous=layers; updated=[]
-                for level,(attention,optimizer) in enumerate(zip(self.layer_attention,self.optimizers)):
-                    memory=torch.stack([*previous,*updated],1); query=(previous[level]+self.layer_embedding[level]).unsqueeze(1)
-                    context=attention(query,memory,memory,need_weights=False)[0][:,0]
-                    lower=current if level==0 else updated[level-1]
-                    updated.append(optimizer(torch.cat([lower,context],-1),previous[level]))
-                layers=updated; top=layers[-1]
-                available=positions.unsqueeze(0)<visible[:,tick:tick+1]
-                if config.exact_address_replay:
-                    address=read_phase.round().long().clamp_min(0)
-                    address=torch.minimum(address,(visible[:,tick]-1).clamp_min(0))
-                    tape_context=embedded[torch.arange(batch,device=inputs.device),address]
-                    weight=None
-                else:
-                    weight=torch.exp(-.5*((positions.unsqueeze(0)-read_phase.unsqueeze(1))/config.read_sigma)**2)*available
-                    weight=weight/weight.sum(1,keepdim=True).clamp_min(1e-6)
-                    tape_context=torch.einsum("bt,btd->bd",weight,embedded)
-                if ablate_tape:tape_context=tape_context*0
-                if ablate_understanding:top=top*0
-                controller=self.controller(torch.cat([current,tape_context,top],-1),controller)
-                decoded=torch.cat([controller,tape_context,top],-1)
-                ready=self.readiness(torch.cat([controller,top],-1)).sigmoid().squeeze(-1)
-                if config.exact_address_replay:
-                    rate=1+config.maximum_rate_correction*self.rate_head(decoded).tanh().squeeze(-1)
-                    step=ready*rate
-                else: step=self.advance(decoded).squeeze(-1)*ready
-                remaining=(visible[:,tick]-1-read_phase).sigmoid(); phases.append(read_phase)
-                read_phase=read_phase+step*remaining
-                if config.exact_address_replay:
-                    logits.append(inputs[torch.arange(batch,device=inputs.device),address])
-                    addresses.append(address)
-                elif self.output_heads is None:
-                    probability=embedded.new_zeros(batch,config.codebooks,config.vocabulary_size)
-                    indices=inputs.clamp_min(0).transpose(1,2)
-                    contributions=weight.unsqueeze(1).expand(-1,config.codebooks,-1)
-                    probability.scatter_add_(2,indices,contributions)
-                    logits.append(probability.clamp_min(1e-8).log())
-                else: logits.append(torch.stack([head(decoded) for head in self.output_heads],1))
-                voices.append(self.voice_head(decoded).squeeze(-1)); readiness_history.append(ready); advances.append(step)
-            diagnostics={"read_phase":torch.stack(phases,1),"readiness":torch.stack(readiness_history,1),"advance":torch.stack(advances,1),"understanding":torch.stack(layers,1)}
-            if addresses: diagnostics["read_address"]=torch.stack(addresses,1)
+                value=torch.where(input_valid[:,tick:tick+1],encoded[:,tick],self.no_audio.unsqueeze(0))
+                for level,(cell,norm) in enumerate(zip(self.encoder_cells,self.encoder_norms)):
+                    proposal=cell(value,states[level]); states[level]=norm(states[level]+self.dropout(proposal))
+                    value=states[level]
+                memories.append(states[-1])
+            memory=torch.stack(memories,1); keys=self.memory_keys(memory); values=self.memory_values(memory)
+            decoder=encoded.new_zeros(batch,dim); previous=self.no_output.unsqueeze(0).expand(batch,-1)
+            logits=[]; voices=[]; attention_history=[]
+            teacher_embedded=teacher_valid=None
+            if teacher_tokens is not None: teacher_embedded,teacher_valid=self._output_embedding(teacher_tokens)
+            scale=dim**-.5
+            for tick in range(ticks):
+                # Only learned encoder activations from audio observed up to this tick are visible.
+                visible=torch.arange(ticks,device=inputs.device).unsqueeze(0)<=tick
+                score=torch.einsum('bd,btd->bt',self.query(decoder),keys)*scale
+                attention=score.masked_fill(~visible,-1e4).softmax(-1)
+                context=torch.einsum('bt,btd->bd',attention,values)
+                current=torch.where(input_valid[:,tick:tick+1],encoded[:,tick],self.no_audio.unsqueeze(0))
+                decoder=self.decoder(torch.cat([current,context,previous],-1),decoder)
+                decoded=torch.cat([decoder,context],-1)
+                step_logits=torch.stack([head(decoded) for head in self.output_heads],1)
+                logits.append(step_logits); voices.append(self.voice_head(decoded).squeeze(-1)); attention_history.append(attention)
+                predicted=torch.stack([table(step_logits[:,book].softmax(-1)) for book,table in enumerate(self.output_embeddings)],0).mean(0)
+                previous=predicted
+                if teacher_embedded is not None and tick+1<ticks and teacher_ratio>0:
+                    use_teacher=(torch.rand(batch,device=inputs.device)<teacher_ratio)&teacher_valid[:,tick]
+                    previous=torch.where(use_teacher.unsqueeze(-1),teacher_embedded[:,tick],previous)
+            diagnostics={"attention":torch.stack(attention_history,1),"understanding":torch.stack(states,1)}
             return torch.stack(logits,1),torch.stack(voices,1),diagnostics
-        def export_config(self):return asdict(config)
+
+        def export_config(self): return asdict(config)
     return CodecCopyModel()
