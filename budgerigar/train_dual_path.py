@@ -24,6 +24,7 @@ class DualPathTrainingConfig:
     contrastive_weight: float = 0.5
     gradient_clip: float = 1.0
     clock_weight: float = 0.0
+    teacher_forcing_ratio: float = 0.0
     seed: int = 41
     initialization_checkpoint: str | None = None
 
@@ -55,7 +56,10 @@ def train_dual_path_echo(feature_manifest, output_dir, training=DualPathTraining
         model.train(); total = count = 0
         for inputs, targets, voice, valid, metadata in train_loader:
             inputs, targets, voice, valid = inputs.to(device), targets.to(device), voice.to(device), valid.to(device)
-            predicted, voice_logits, _, diagnostics = model(inputs)
+            if getattr(model_config, "output_feedback", False):
+                predicted, voice_logits, _, diagnostics = model(inputs, teacher_mel=targets, teacher_forcing_ratio=training.teacher_forcing_ratio)
+            else:
+                predicted, voice_logits, _, diagnostics = model(inputs)
             frame_l1 = (predicted - targets).abs().mean(-1)
             acoustic = (frame_l1 * (1 + 3 * voice))[valid].mean()
             confidence = functional.binary_cross_entropy_with_logits(voice_logits[valid], voice[valid])
