@@ -28,7 +28,8 @@ class DualPathTrainingConfig:
 
 
 def train_dual_path_echo(feature_manifest, output_dir, training=DualPathTrainingConfig(),
-                         model_config=DualPathEchoConfig(), stats=None):
+                         model_config=DualPathEchoConfig(), stats=None, model_factory=create_dual_path_echo,
+                         architecture="dual_path_neural_echo", ablation_names=("local", "abstract")):
     torch, _, functional = require_torch(); torch.manual_seed(training.seed); random.seed(training.seed)
     pairs = load_pairs(feature_manifest, training.target_speaker)
     train_pairs = [p for p in pairs if p.split == "train"][:training.max_train_pairs]
@@ -40,7 +41,7 @@ def train_dual_path_echo(feature_manifest, output_dir, training=DualPathTraining
     train_loader = loader(train_set, batch_size=training.batch_size, shuffle=True, num_workers=0, collate_fn=collate_episodes)
     validation_loader = loader(validation_set, batch_size=training.batch_size, shuffle=False, num_workers=0, collate_fn=collate_episodes)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = create_dual_path_echo(model_config).to(device)
+    model = model_factory(model_config).to(device)
     if training.initialization_checkpoint:
         source = torch.load(training.initialization_checkpoint, map_location="cpu", weights_only=True)
         current = model.state_dict(); transferred = {k: v for k, v in source["model"].items() if k in current and current[k].shape == v.shape}
@@ -68,7 +69,9 @@ def train_dual_path_echo(feature_manifest, output_dir, training=DualPathTraining
             for inputs, targets, voice, valid, _ in validation_loader:
                 inputs, targets, voice, valid = inputs.to(device), targets.to(device), voice.to(device), valid.to(device)
                 mask = (voice > .5) & valid
-                full = model(inputs)[0]; no_local = model(inputs, ablate_local=True)[0]; no_abstract = model(inputs, ablate_abstract=True)[0]
+                full = model(inputs)[0]
+                no_local = model(inputs, **{f"ablate_{ablation_names[0]}": True})[0]
+                no_abstract = model(inputs, **{f"ablate_{ablation_names[1]}": True})[0]
                 full_l1 += float((full[mask] - targets[mask]).abs().mean())
                 local_l1 += float((no_local[mask] - targets[mask]).abs().mean())
                 abstract_l1 += float((no_abstract[mask] - targets[mask]).abs().mean()); batches += 1
@@ -77,11 +80,11 @@ def train_dual_path_echo(feature_manifest, output_dir, training=DualPathTraining
                    "no_local_degradation": (local_l1 - full_l1) / batches,
                    "no_abstract_degradation": (abstract_l1 - full_l1) / batches}
         history.append(metrics); print(json.dumps(metrics), flush=True)
-        checkpoint = {"architecture":"dual_path_neural_echo", "model":model.state_dict(), "optimizer":optimizer.state_dict(),
+        checkpoint = {"architecture":architecture, "model":model.state_dict(), "optimizer":optimizer.state_dict(),
                       "stats":stats, "model_config":asdict(model_config), "training_config":asdict(training), "history":history}
         torch.save(checkpoint, output_dir / "last.pt")
         if metrics["validation_repeat_l1"] < best: best = metrics["validation_repeat_l1"]; torch.save(checkpoint, output_dir / "best.pt")
         if step >= training.max_steps: break
-    report = {"architecture":"dual_path_neural_echo", "steps":step, "best_validation_repeat_l1":best, "history":history}
+    report = {"architecture":architecture, "steps":step, "best_validation_repeat_l1":best, "history":history}
     (output_dir / "training_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return report

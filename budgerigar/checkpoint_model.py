@@ -3,6 +3,7 @@ from __future__ import annotations
 from .hierarchical_echo import HierarchicalEchoConfig, create_hierarchical_echo
 from .neural_echo import NeuralEchoConfig, create_neural_echo
 from .dual_path_echo import DualPathEchoConfig, create_dual_path_echo
+from .monotonic_echo import MonotonicEchoConfig, create_monotonic_echo
 
 
 def restore_echo_model(checkpoint, device):
@@ -11,6 +12,8 @@ def restore_echo_model(checkpoint, device):
         model = create_hierarchical_echo(HierarchicalEchoConfig(**checkpoint["model_config"]))
     elif architecture == "dual_path_neural_echo":
         model = create_dual_path_echo(DualPathEchoConfig(**checkpoint["model_config"]))
+    elif architecture == "monotonic_understanding_echo":
+        model = create_monotonic_echo(MonotonicEchoConfig(**checkpoint["model_config"]))
     elif architecture in {"neural_echo", "continuous_neural_listen_then_repeat"}:
         model = create_neural_echo(NeuralEchoConfig(**checkpoint["model_config"]))
     else:
@@ -21,7 +24,7 @@ def restore_echo_model(checkpoint, device):
 
 def forward_echo(model, architecture, inputs):
     result = model(inputs)
-    if architecture in {"hierarchical_token_echo", "dual_path_neural_echo"}:
+    if architecture in {"hierarchical_token_echo", "dual_path_neural_echo", "monotonic_understanding_echo"}:
         mel, voice_logits, memory, diagnostics = result
         return mel, voice_logits, memory, diagnostics
     mel, voice_logits, memory = result
