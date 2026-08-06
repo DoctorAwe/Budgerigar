@@ -11,6 +11,7 @@ class CodecCopyConfig:
     understanding_layers:int=4
     attention_heads:int=4
     read_sigma:float=0.65
+    direct_tape_logits:bool=False
 
 
 def create_codec_copy_model(config=CodecCopyConfig()):
@@ -26,7 +27,7 @@ def create_codec_copy_model(config=CodecCopyConfig()):
             self.readiness=nn.Sequential(nn.LayerNorm(dim*2),nn.Linear(dim*2,1))
             self.advance=nn.Sequential(nn.LayerNorm(dim*3),nn.Linear(dim*3,1),nn.Softplus())
             self.voice_head=nn.Sequential(nn.LayerNorm(dim*3),nn.Linear(dim*3,1))
-            self.output_heads=nn.ModuleList([nn.Linear(dim*3,config.vocabulary_size) for _ in range(config.codebooks)])
+            self.output_heads=None if config.direct_tape_logits else nn.ModuleList([nn.Linear(dim*3,config.vocabulary_size) for _ in range(config.codebooks)])
 
         def _embed(self,codes):
             valid=codes.ge(0); clamped=codes.clamp_min(0)
@@ -60,7 +61,14 @@ def create_codec_copy_model(config=CodecCopyConfig()):
                 ready=self.readiness(torch.cat([controller,top],-1)).sigmoid().squeeze(-1)
                 step=self.advance(decoded).squeeze(-1)*ready
                 remaining=(visible[:,tick]-read_phase).sigmoid(); read_phase=read_phase+step*remaining
-                logits.append(torch.stack([head(decoded) for head in self.output_heads],1)); voices.append(self.voice_head(decoded).squeeze(-1)); phases.append(read_phase); readiness_history.append(ready)
+                if self.output_heads is None:
+                    probability=embedded.new_zeros(batch,config.codebooks,config.vocabulary_size)
+                    indices=inputs.clamp_min(0).transpose(1,2)
+                    contributions=weight.unsqueeze(1).expand(-1,config.codebooks,-1)
+                    probability.scatter_add_(2,indices,contributions)
+                    logits.append(probability.clamp_min(1e-8).log())
+                else: logits.append(torch.stack([head(decoded) for head in self.output_heads],1))
+                voices.append(self.voice_head(decoded).squeeze(-1)); phases.append(read_phase); readiness_history.append(ready)
             diagnostics={"read_phase":torch.stack(phases,1),"readiness":torch.stack(readiness_history,1),"understanding":torch.stack(layers,1)}
             return torch.stack(logits,1),torch.stack(voices,1),diagnostics
         def export_config(self):return asdict(config)

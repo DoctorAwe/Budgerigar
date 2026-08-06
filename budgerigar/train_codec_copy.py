@@ -41,14 +41,15 @@ def train_codec_copy(manifest,output_dir,training=CodecCopyTrainingConfig(),mode
             step+=1; total+=float(loss); count+=1
             if step==1 or step%10==0:print(f"[copy train] step={step} loss={float(loss):.4f} token={float(token_loss):.4f} voice={float(voice_loss):.4f} clock={float(clock):.4f}",flush=True)
             if step>=training.max_steps:break
-        model.eval(); correct=tokens=exact=examples=0; early=[]
+        model.eval(); correct=tokens=exact=examples=0; early=[]; repeat_recall=[]
         with torch.no_grad():
             for inputs,targets,voice,valid,_ in validation_loader:
                 inputs,targets,voice,valid=inputs.to(device),targets.to(device),voice.to(device),valid.to(device); predicted,voice_logits,_=model(inputs); chosen=predicted.argmax(-1); mask=targets.ge(0)
                 correct+=int(chosen[mask].eq(targets[mask]).sum()); tokens+=int(mask.sum())
                 per_frame=(chosen.eq(targets)|~mask).all((1,2)); exact+=int(per_frame.sum()); examples+=len(inputs)
-                silent=(voice<.5)&valid; early.append(float((voice_logits.sigmoid()[silent]>=.5).float().mean()))
-        metrics={"epoch":epoch+1,"step":step,"train_loss":total/count,"validation_token_accuracy":correct/max(tokens,1),"validation_exact_utterance_rate":exact/max(examples,1),"validation_early_voice_rate":sum(early)/len(early)}
+                probability=voice_logits.sigmoid(); silent=(voice<.5)&valid; speaking=(voice>=.5)&valid
+                early.append(float((probability[silent]>=.5).float().mean())); repeat_recall.append(float((probability[speaking]>=.5).float().mean()))
+        metrics={"epoch":epoch+1,"step":step,"train_loss":total/count,"validation_token_accuracy":correct/max(tokens,1),"validation_exact_utterance_rate":exact/max(examples,1),"validation_early_voice_rate":sum(early)/len(early),"validation_repeat_voice_recall":sum(repeat_recall)/len(repeat_recall)}
         history.append(metrics);print(json.dumps(metrics),flush=True)
         checkpoint={"architecture":"codec_token_tape_copy","model":model.state_dict(),"model_config":asdict(model_config),"training_config":asdict(training),"history":history}
         torch.save(checkpoint,output_dir/"last.pt")
