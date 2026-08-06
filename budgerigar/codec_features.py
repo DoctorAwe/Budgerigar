@@ -13,7 +13,8 @@ def extract_encodec_manifest(manifest, output_root, output_manifest, model_id="f
                             bandwidth=6.0, revision="main", limit=None):
     import torch, torchaudio
     from transformers import AutoProcessor, EncodecModel
-    rows=[json.loads(line) for line in Path(manifest).read_text(encoding="utf-8").splitlines() if line.strip()]
+    manifest=Path(manifest)
+    rows=[json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip()]
     if limit is not None: rows=rows[:limit]
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
     processor=AutoProcessor.from_pretrained(model_id,revision=revision)
@@ -22,7 +23,9 @@ def extract_encodec_manifest(manifest, output_root, output_manifest, model_id="f
     written=[]
     with torch.no_grad():
         for index,row in enumerate(rows,1):
-            waveform,sample_rate=torchaudio.load(row["audio_path"]); waveform=waveform.mean(0)
+            audio_path=Path(row["audio"])
+            if not audio_path.is_absolute(): audio_path=(manifest.parent/audio_path).resolve()
+            waveform,sample_rate=torchaudio.load(str(audio_path)); waveform=waveform.mean(0)
             if sample_rate != 24000: waveform=torchaudio.functional.resample(waveform,sample_rate,24000)
             prepared=processor(raw_audio=waveform.numpy(),sampling_rate=24000,return_tensors="pt")
             values=prepared["input_values"].to(device); mask=prepared.get("padding_mask")
@@ -32,7 +35,7 @@ def extract_encodec_manifest(manifest, output_root, output_manifest, model_id="f
             torch.save({"audio_codes":encoded.audio_codes.cpu(),"audio_scales":[s.cpu() if s is not None else None for s in encoded.audio_scales],
                         "audio_length":len(waveform),"sample_rate":24000,"model_id":model_id,"bandwidth":bandwidth,
                         "revision":revision,"codec_fingerprint":fingerprint},path)
-            item=dict(row); item.update({"codec_path":str(path),"codec_fingerprint":fingerprint,
+            item=dict(row); item["audio"]=str(audio_path); item.update({"codec_path":str(path),"codec_fingerprint":fingerprint,
                                          "codec_frames":int(encoded.audio_codes.shape[-1]),"codec_bandwidth":bandwidth})
             written.append(item)
             if index==1 or index%50==0 or index==len(rows): print(f"[codec] {index}/{len(rows)}",flush=True)
