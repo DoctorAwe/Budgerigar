@@ -32,24 +32,28 @@ def train_codec_copy(manifest,output_dir,training=CodecCopyTrainingConfig(),mode
         model.train(); total=count=0
         for inputs,targets,voice,valid,_ in train_loader:
             inputs,targets,voice,valid=inputs.to(device),targets.to(device),voice.to(device),valid.to(device)
-            logits,voice_logits,diagnostics=model(inputs); repeat=targets.ge(0)
-            token_loss=functional.cross_entropy(logits[repeat],targets[repeat])
+            predicted,voice_logits,diagnostics=model(inputs); repeat=targets.ge(0)
+            if model_config.exact_address_replay:
+                token_loss=voice_logits.new_zeros(())
+            else: token_loss=functional.cross_entropy(predicted[repeat],targets[repeat])
             voice_loss=functional.binary_cross_entropy_with_logits(voice_logits[valid],voice[valid])
-            desired=voice.cumsum(1); clock=functional.smooth_l1_loss(diagnostics["read_phase"][valid]/inputs.shape[1],desired[valid]/inputs.shape[1])
-            loss=token_loss+.25*voice_loss+training.clock_weight*clock
+            desired=(voice.cumsum(1)-1).clamp_min(0); source_lengths=inputs.ge(0).any(-1).sum(1,keepdim=True).clamp_min(1)
+            clock=functional.smooth_l1_loss(diagnostics["read_phase"][valid]/source_lengths.expand_as(voice)[valid],desired[valid]/source_lengths.expand_as(voice)[valid])
+            rate=((diagnostics["advance"]-voice)**2)[valid].mean()
+            loss=token_loss+.25*voice_loss+training.clock_weight*clock+(rate if model_config.exact_address_replay else 0)
             optimizer.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(),training.gradient_clip); optimizer.step()
             step+=1; total+=float(loss.detach()); count+=1
-            if step==1 or step%10==0:print(f"[copy train] step={step} loss={float(loss):.4f} token={float(token_loss):.4f} voice={float(voice_loss):.4f} clock={float(clock):.4f}",flush=True)
+            if step==1 or step%10==0:print(f"[copy train] step={step} loss={float(loss):.4f} token={float(token_loss):.4f} voice={float(voice_loss):.4f} clock={float(clock):.4f} rate={float(rate):.4f}",flush=True)
             if step>=training.max_steps:break
         model.eval(); correct=tokens=exact=examples=0; early=[]; repeat_recall=[]; phase_error=[]
         with torch.no_grad():
             for inputs,targets,voice,valid,_ in validation_loader:
-                inputs,targets,voice,valid=inputs.to(device),targets.to(device),voice.to(device),valid.to(device); predicted,voice_logits,diagnostics=model(inputs); chosen=predicted.argmax(-1); mask=targets.ge(0)
+                inputs,targets,voice,valid=inputs.to(device),targets.to(device),voice.to(device),valid.to(device); predicted,voice_logits,diagnostics=model(inputs); chosen=predicted if model_config.exact_address_replay else predicted.argmax(-1); mask=targets.ge(0)
                 correct+=int(chosen[mask].eq(targets[mask]).sum()); tokens+=int(mask.sum())
                 per_frame=(chosen.eq(targets)|~mask).all((1,2)); exact+=int(per_frame.sum()); examples+=len(inputs)
                 probability=voice_logits.sigmoid(); silent=(voice<.5)&valid; speaking=(voice>=.5)&valid
                 early.append(float((probability[silent]>=.5).float().mean())); repeat_recall.append(float((probability[speaking]>=.5).float().mean()))
-                desired=voice.cumsum(1); phase_error.append(float((diagnostics["read_phase"][valid]-desired[valid]).abs().mean()))
+                desired=(voice.cumsum(1)-1).clamp_min(0); phase_error.append(float((diagnostics["read_phase"][valid]-desired[valid]).abs().mean()))
         metrics={"epoch":epoch+1,"step":step,"train_loss":total/count,"validation_token_accuracy":correct/max(tokens,1),"validation_exact_utterance_rate":exact/max(examples,1),"validation_early_voice_rate":sum(early)/len(early),"validation_repeat_voice_recall":sum(repeat_recall)/len(repeat_recall),"validation_read_phase_mae_frames":sum(phase_error)/len(phase_error)}
         history.append(metrics);print(json.dumps(metrics),flush=True)
         checkpoint={"architecture":"codec_token_tape_copy","model":model.state_dict(),"model_config":asdict(model_config),"training_config":asdict(training),"history":history}

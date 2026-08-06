@@ -12,6 +12,8 @@ class CodecCopyConfig:
     attention_heads:int=4
     read_sigma:float=0.65
     direct_tape_logits:bool=False
+    exact_address_replay:bool=False
+    maximum_rate_correction:float=0.05
 
 
 def create_codec_copy_model(config=CodecCopyConfig()):
@@ -27,7 +29,8 @@ def create_codec_copy_model(config=CodecCopyConfig()):
             self.readiness=nn.Sequential(nn.LayerNorm(dim*2),nn.Linear(dim*2,1))
             self.advance=nn.Sequential(nn.LayerNorm(dim*3),nn.Linear(dim*3,1),nn.Softplus())
             self.voice_head=nn.Sequential(nn.LayerNorm(dim*3),nn.Linear(dim*3,1))
-            self.output_heads=None if config.direct_tape_logits else nn.ModuleList([nn.Linear(dim*3,config.vocabulary_size) for _ in range(config.codebooks)])
+            self.rate_head=nn.Sequential(nn.LayerNorm(dim*3),nn.Linear(dim*3,1))
+            self.output_heads=None if (config.direct_tape_logits or config.exact_address_replay) else nn.ModuleList([nn.Linear(dim*3,config.vocabulary_size) for _ in range(config.codebooks)])
 
         def _embed(self,codes):
             valid=codes.ge(0); clamped=codes.clamp_min(0)
@@ -39,7 +42,7 @@ def create_codec_copy_model(config=CodecCopyConfig()):
             positions=torch.arange(ticks,device=inputs.device,dtype=embedded.dtype)
             layers=[embedded.new_zeros(batch,dim) for _ in range(config.understanding_layers)]
             controller=embedded.new_zeros(batch,dim); read_phase=embedded.new_zeros(batch)
-            logits=[]; voices=[]; phases=[]; readiness_history=[]
+            logits=[]; voices=[]; phases=[]; readiness_history=[]; advances=[]; addresses=[]
             visible=input_valid.cumsum(1)
             for tick in range(ticks):
                 current=torch.where(input_valid[:,tick:tick+1],embedded[:,tick],self.silence.unsqueeze(0))
@@ -51,25 +54,39 @@ def create_codec_copy_model(config=CodecCopyConfig()):
                     updated.append(optimizer(torch.cat([lower,context],-1),previous[level]))
                 layers=updated; top=layers[-1]
                 available=positions.unsqueeze(0)<visible[:,tick:tick+1]
-                weight=torch.exp(-.5*((positions.unsqueeze(0)-read_phase.unsqueeze(1))/config.read_sigma)**2)*available
-                weight=weight/weight.sum(1,keepdim=True).clamp_min(1e-6)
-                tape_context=torch.einsum("bt,btd->bd",weight,embedded)
+                if config.exact_address_replay:
+                    address=read_phase.round().long().clamp_min(0)
+                    address=torch.minimum(address,(visible[:,tick]-1).clamp_min(0))
+                    tape_context=embedded[torch.arange(batch,device=inputs.device),address]
+                    weight=None
+                else:
+                    weight=torch.exp(-.5*((positions.unsqueeze(0)-read_phase.unsqueeze(1))/config.read_sigma)**2)*available
+                    weight=weight/weight.sum(1,keepdim=True).clamp_min(1e-6)
+                    tape_context=torch.einsum("bt,btd->bd",weight,embedded)
                 if ablate_tape:tape_context=tape_context*0
                 if ablate_understanding:top=top*0
                 controller=self.controller(torch.cat([current,tape_context,top],-1),controller)
                 decoded=torch.cat([controller,tape_context,top],-1)
                 ready=self.readiness(torch.cat([controller,top],-1)).sigmoid().squeeze(-1)
-                step=self.advance(decoded).squeeze(-1)*ready
-                remaining=(visible[:,tick]-read_phase).sigmoid(); read_phase=read_phase+step*remaining
-                if self.output_heads is None:
+                if config.exact_address_replay:
+                    rate=1+config.maximum_rate_correction*self.rate_head(decoded).tanh().squeeze(-1)
+                    step=ready*rate
+                else: step=self.advance(decoded).squeeze(-1)*ready
+                remaining=(visible[:,tick]-1-read_phase).sigmoid(); phases.append(read_phase)
+                read_phase=read_phase+step*remaining
+                if config.exact_address_replay:
+                    logits.append(inputs[torch.arange(batch,device=inputs.device),address])
+                    addresses.append(address)
+                elif self.output_heads is None:
                     probability=embedded.new_zeros(batch,config.codebooks,config.vocabulary_size)
                     indices=inputs.clamp_min(0).transpose(1,2)
                     contributions=weight.unsqueeze(1).expand(-1,config.codebooks,-1)
                     probability.scatter_add_(2,indices,contributions)
                     logits.append(probability.clamp_min(1e-8).log())
                 else: logits.append(torch.stack([head(decoded) for head in self.output_heads],1))
-                voices.append(self.voice_head(decoded).squeeze(-1)); phases.append(read_phase); readiness_history.append(ready)
-            diagnostics={"read_phase":torch.stack(phases,1),"readiness":torch.stack(readiness_history,1),"understanding":torch.stack(layers,1)}
+                voices.append(self.voice_head(decoded).squeeze(-1)); readiness_history.append(ready); advances.append(step)
+            diagnostics={"read_phase":torch.stack(phases,1),"readiness":torch.stack(readiness_history,1),"advance":torch.stack(advances,1),"understanding":torch.stack(layers,1)}
+            if addresses: diagnostics["read_address"]=torch.stack(addresses,1)
             return torch.stack(logits,1),torch.stack(voices,1),diagnostics
         def export_config(self):return asdict(config)
     return CodecCopyModel()
