@@ -10,7 +10,7 @@ class ShortMemoryConfig:
     cochlear_kernel:int=129
     subframes:int=4
     hidden_dim:int=96
-    token_layers:int=16
+    token_layers:int=4
     attention_heads:int=4
     output_classes:int=11
 
