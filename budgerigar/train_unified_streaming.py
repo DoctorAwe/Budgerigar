@@ -19,7 +19,7 @@ class UnifiedStreamingTrainingConfig:
     max_validation_records:int=100
     source_probe_weight:float=.1
     source_probe_every_steps:int=4
-    frozen_content_weight:float=.5
+    frozen_content_weight:float=.2
     content_every_steps:int=2
     auxiliary_start_step:int=200
     waveform_weight:float=5.0
@@ -28,6 +28,8 @@ class UnifiedStreamingTrainingConfig:
     latent_contrastive_weight:float=.5
     latent_contrastive_margin:float=.02
     latent_contrastive_every_steps:int=4
+    boundary_weight:float=2.0
+    curvature_weight:float=.5
     seed:int=149
 
 
@@ -54,20 +56,20 @@ def train_unified_streaming(manifest,output_dir,evaluator_checkpoint,training=Un
     torch,_,functional=require_torch();torch.manual_seed(training.seed);random.seed(training.seed);dataset=lambda split,limit:ShortMemoryEpisodeDataset(manifest,split,model_config.sample_rate,model_config.tick_samples,max_records=limit);train=dataset("train",training.max_train_records);validation=dataset("validation",training.max_validation_records);loader=torch.utils.data.DataLoader;train_loader=loader(train,batch_size=training.batch_size,shuffle=True,collate_fn=collate_short_memory);validation_loader=loader(validation,batch_size=training.batch_size,collate_fn=collate_short_memory)
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu");payload=torch.load(evaluator_checkpoint,map_location=device,weights_only=False);evaluator=create_auditory_evaluator(AuditoryEvaluatorConfig(**payload["model_config"])).to(device);evaluator.load_state_dict(payload["model"]);evaluator.eval();evaluator.requires_grad_(False);model=create_unified_streaming_autoencoder(model_config).to(device);optimizer=torch.optim.AdamW(model.parameters(),lr=training.learning_rate,betas=(.8,.99));output_dir=Path(output_dir);output_dir.mkdir(parents=True,exist_ok=True);history=[];best=math.inf;step=0
     if resume_from is not None:
-        resumed=torch.load(resume_from,map_location=device,weights_only=False);model.load_state_dict(resumed["model"]);history=list(resumed.get("history",[]));step=int(history[-1]["step"]) if history else int(resumed.get("step",0));best=min((item["validation_spectral_loss"]+.5*(1-item["validation_frozen_output_digit_accuracy"]) for item in history),default=math.inf)
-        if "optimizer" in resumed:optimizer.load_state_dict(resumed["optimizer"]);optimizer_source="checkpoint"
-        else:optimizer_source="fresh (legacy checkpoint)"
-        print(f"[unified resume] step={step} history={len(history)} optimizer={optimizer_source}",flush=True)
+        resumed=torch.load(resume_from,map_location=device,weights_only=False);current=model.state_dict();compatible={name:value for name,value in resumed["model"].items() if name in current and current[name].shape==value.shape};missing=model.load_state_dict(compatible,strict=False);history=list(resumed.get("history",[]));step=int(history[-1]["step"]) if history else int(resumed.get("step",0));best=min((item["validation_spectral_loss"]+.5*(1-item["validation_frozen_output_digit_accuracy"]) for item in history),default=math.inf)
+        if "optimizer" in resumed and not missing.missing_keys:optimizer.load_state_dict(resumed["optimizer"]);optimizer_source="checkpoint"
+        else:optimizer_source="fresh (new or legacy parameters)"
+        print(f"[unified resume] step={step} history={len(history)} tensors={len(compatible)} new={len(missing.missing_keys)} optimizer={optimizer_source}",flush=True)
     log_started=time.perf_counter()
     for epoch in range(training.epochs):
         model.train();total=count=0
         for ticks,_,_,metadata in train_loader:
-            ticks=ticks.to(device);waveform=ticks.flatten(1);labels=torch.tensor([item["label"] for item in metadata],device=device);reconstructed,_,diagnostics=model(ticks);reconstructed=reconstructed.flatten(1);weight=1+4*waveform.abs().gt(.01);wave=((reconstructed-waveform).abs()*weight).sum()/weight.sum();derivative=functional.l1_loss(reconstructed[:,1:]-reconstructed[:,:-1],waveform[:,1:]-waveform[:,:-1]);spectral=_spectral_loss(torch,reconstructed.float(),waveform.float(),((256,64),(512,128)));sdr=20*torch.tanh(_si_sdr(torch,reconstructed,waveform)/20).mean();auxiliary=step>=training.auxiliary_start_step;use_probe=auxiliary and (step%training.source_probe_every_steps)==0;probe=_source_probe_loss(torch,functional,diagnostics["source_probe"],waveform,model_config) if use_probe else wave.new_zeros(());use_content=auxiliary and (step%training.content_every_steps)==0;content=functional.cross_entropy(evaluator(robust_waveform_augmentation(torch,reconstructed)),labels) if use_content else wave.new_zeros(());use_contrastive=auxiliary and len(ticks)>1 and (step%training.latent_contrastive_every_steps)==0
+            ticks=ticks.to(device);waveform=ticks.flatten(1);labels=torch.tensor([item["label"] for item in metadata],device=device);reconstructed,_,diagnostics=model(ticks);reconstructed=reconstructed.flatten(1);weight=1+4*waveform.abs().gt(.01);wave=((reconstructed-waveform).abs()*weight).sum()/weight.sum();derivative=functional.l1_loss(reconstructed[:,1:]-reconstructed[:,:-1],waveform[:,1:]-waveform[:,:-1]);curvature=functional.l1_loss(reconstructed[:,2:]-2*reconstructed[:,1:-1]+reconstructed[:,:-2],waveform[:,2:]-2*waveform[:,1:-1]+waveform[:,:-2]);subframe=model_config.tick_samples//model_config.subframes;boundaries=torch.arange(subframe,waveform.shape[-1],subframe,device=device);boundary=functional.l1_loss(reconstructed[:,boundaries]-reconstructed[:,boundaries-1],waveform[:,boundaries]-waveform[:,boundaries-1]);spectral=_spectral_loss(torch,reconstructed.float(),waveform.float(),((256,64),(512,128)));sdr=20*torch.tanh(_si_sdr(torch,reconstructed,waveform)/20).mean();auxiliary=step>=training.auxiliary_start_step;use_probe=auxiliary and (step%training.source_probe_every_steps)==0;probe=_source_probe_loss(torch,functional,diagnostics["source_probe"],waveform,model_config) if use_probe else wave.new_zeros(());use_content=auxiliary and (step%training.content_every_steps)==0;content=functional.cross_entropy(evaluator(robust_waveform_augmentation(torch,reconstructed)),labels) if use_content else wave.new_zeros(());use_contrastive=auxiliary and len(ticks)>1 and (step%training.latent_contrastive_every_steps)==0
             if use_contrastive:
                 latent=diagnostics["latent"];shuffled=model.decode(latent.roll(1,0))[0].flatten(1);mean_output=model.decode(latent.mean(0,keepdim=True).expand_as(latent))[0].flatten(1);correct_error=(reconstructed-waveform).abs().mean(-1);shuffled_error=(shuffled-waveform).abs().mean(-1);mean_error=(mean_output-waveform).abs().mean(-1);latent_contrastive=(training.latent_contrastive_margin+correct_error-shuffled_error).relu().mean()+(training.latent_contrastive_margin+correct_error-mean_error).relu().mean()
             else:latent_contrastive=wave.new_zeros(())
-            loss=training.waveform_weight*wave+training.derivative_weight*derivative+spectral-training.si_sdr_weight*sdr+training.source_probe_weight*probe+training.frozen_content_weight*content+training.latent_contrastive_weight*latent_contrastive;optimizer.zero_grad(set_to_none=True);loss.backward();torch.nn.utils.clip_grad_norm_(model.parameters(),1.0);optimizer.step();step+=1;total+=float(loss.detach());count+=1
-            if step==1 or step%10==0:elapsed=time.perf_counter()-log_started;print(f"[unified M0] step={step} loss={float(loss.detach()):.4f} wave={float(wave.detach()):.4f} spectral={float(spectral.detach()):.4f} si_sdr={float(sdr.detach()):.2f} frozen_content={float(content.detach()):.4f} latent_nce={float(latent_contrastive.detach()):.4f} seconds_per_10={elapsed/(1 if step==1 else 10):.2f}",flush=True);log_started=time.perf_counter()
+            loss=training.waveform_weight*wave+training.derivative_weight*derivative+training.curvature_weight*curvature+training.boundary_weight*boundary+spectral-training.si_sdr_weight*sdr+training.source_probe_weight*probe+training.frozen_content_weight*content+training.latent_contrastive_weight*latent_contrastive;optimizer.zero_grad(set_to_none=True);loss.backward();torch.nn.utils.clip_grad_norm_(model.parameters(),1.0);optimizer.step();step+=1;total+=float(loss.detach());count+=1
+            if step==1 or step%10==0:elapsed=time.perf_counter()-log_started;print(f"[unified M0] step={step} loss={float(loss.detach()):.4f} wave={float(wave.detach()):.4f} boundary={float(boundary.detach()):.4f} spectral={float(spectral.detach()):.4f} si_sdr={float(sdr.detach()):.2f} frozen_content={float(content.detach()):.4f} latent_nce={float(latent_contrastive.detach()):.4f} seconds_per_10={elapsed/(1 if step==1 else 10):.2f}",flush=True);log_started=time.perf_counter()
             if step>=training.max_steps:break
         model.eval();spectral_values=[];shuffled_values=[];mean_values=[];sdr=[];input_separation=[];output_separation=[];real_correct=output_correct=examples=0;example=None
         with torch.no_grad():
