@@ -34,7 +34,7 @@ def train_short_memory(manifest,output_dir,training=ShortMemoryTrainingConfig(),
         model.eval();correct=emitted=examples=0;early=0;onset=[];stream_match=[]
         with torch.no_grad():
             for samples,_,valid,metadata in validation_loader:
-                samples=samples.to(device);logits,_,_=model(samples);chosen=logits.argmax(-1)
+                samples,valid=samples.to(device),valid.to(device);logits,_,_=model(samples);chosen=logits.argmax(-1)
                 # Verify repeated stream_step calls are numerically identical to batched causal forward.
                 state=None;parts=[]
                 for tick in range(samples.shape[1]):value,state,_=model.stream_step(samples[:,tick],state);parts.append(value)
