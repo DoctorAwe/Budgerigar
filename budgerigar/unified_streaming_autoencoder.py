@@ -9,7 +9,7 @@ class UnifiedStreamingConfig:
     tick_samples:int=160
     subframes:int=4
     hidden_dim:int=128
-    latent_dim:int=32
+    latent_dim:int=40
     recurrent_layers:int=2
 
 
@@ -20,11 +20,11 @@ def create_unified_streaming_autoencoder(config=UnifiedStreamingConfig()):
     class UnifiedStreamingAutoencoder(nn.Module):
         def __init__(self):
             super().__init__();self.config=config
-            self.hearing=nn.Sequential(nn.Linear(subframe_samples,config.hidden_dim),nn.LayerNorm(config.hidden_dim),nn.SiLU());self.encoder=nn.GRU(config.hidden_dim,config.hidden_dim,num_layers=config.recurrent_layers,batch_first=True);self.latent=nn.Sequential(nn.Linear(config.hidden_dim,config.latent_dim),nn.Tanh());self.latent_projection=nn.Sequential(nn.Linear(config.latent_dim,config.hidden_dim),nn.LayerNorm(config.hidden_dim),nn.SiLU());self.decoder=nn.GRU(config.hidden_dim,config.hidden_dim,num_layers=config.recurrent_layers,batch_first=True);self.waveform=nn.Linear(config.hidden_dim,subframe_samples);self.source_probe=nn.Linear(config.hidden_dim,3)
+            self.hearing=nn.Sequential(nn.Linear(subframe_samples,config.hidden_dim),nn.LayerNorm(config.hidden_dim),nn.SiLU());self.encoder=nn.GRU(config.hidden_dim,config.hidden_dim,num_layers=config.recurrent_layers,batch_first=True);self.local_latent=nn.Linear(config.hidden_dim,config.latent_dim);self.context_latent=nn.Linear(config.hidden_dim,config.latent_dim);self.latent_projection=nn.Sequential(nn.Linear(config.latent_dim,config.hidden_dim),nn.LayerNorm(config.hidden_dim),nn.SiLU());self.decoder=nn.GRU(config.hidden_dim,config.hidden_dim,num_layers=config.recurrent_layers,batch_first=True);self.local_waveform=nn.Sequential(nn.Linear(config.latent_dim,config.hidden_dim),nn.SiLU(),nn.Linear(config.hidden_dim,subframe_samples));self.context_waveform=nn.Linear(config.hidden_dim,subframe_samples);self.source_probe=nn.Linear(config.hidden_dim,3)
         def encode(self,ticks,state=None):
-            batch,length,samples=ticks.shape;subframes=ticks.view(batch,length*config.subframes,subframe_samples);encoded,state=self.encoder(self.hearing(subframes),state);latent=self.latent(encoded);return latent,state,encoded
+            batch,length,samples=ticks.shape;subframes=ticks.view(batch,length*config.subframes,subframe_samples);heard=self.hearing(subframes);encoded,state=self.encoder(heard,state);latent=(self.local_latent(heard)+.25*self.context_latent(encoded)).tanh();return latent,state,encoded
         def decode(self,latent,state=None):
-            decoded,state=self.decoder(self.latent_projection(latent),state);waveform=self.waveform(decoded).tanh();batch=latent.shape[0];return waveform.reshape(batch,-1,config.tick_samples),state
+            decoded,state=self.decoder(self.latent_projection(latent),state);waveform=(self.local_waveform(latent)+.25*self.context_waveform(decoded)).tanh();batch=latent.shape[0];return waveform.reshape(batch,-1,config.tick_samples),state
         def probe_source(self,encoded):
             batch,subframes,_=encoded.shape;pooled=encoded.view(batch,-1,config.subframes,config.hidden_dim).mean(2);raw=self.source_probe(pooled);voiced=raw[...,2].sigmoid();return {"drive":raw[...,0].sigmoid(),"f0_hz":60+340*raw[...,1].sigmoid(),"voiced":voiced}
         def stream_step(self,tick,state=None):

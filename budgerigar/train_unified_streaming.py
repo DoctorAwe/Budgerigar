@@ -21,6 +21,10 @@ class UnifiedStreamingTrainingConfig:
     source_probe_every_steps:int=4
     frozen_content_weight:float=.5
     content_every_steps:int=2
+    auxiliary_start_step:int=200
+    waveform_weight:float=5.0
+    derivative_weight:float=1.0
+    si_sdr_weight:float=.05
     seed:int=149
 
 
@@ -49,8 +53,8 @@ def train_unified_streaming(manifest,output_dir,evaluator_checkpoint,training=Un
     for epoch in range(training.epochs):
         model.train();total=count=0
         for ticks,_,_,metadata in train_loader:
-            ticks=ticks.to(device);waveform=ticks.flatten(1);labels=torch.tensor([item["label"] for item in metadata],device=device);reconstructed,_,diagnostics=model(ticks);reconstructed=reconstructed.flatten(1);wave=functional.l1_loss(reconstructed,waveform);spectral=_spectral_loss(torch,reconstructed.float(),waveform.float(),((256,64),(512,128)));use_probe=(step%training.source_probe_every_steps)==0;probe=_source_probe_loss(torch,functional,diagnostics["source_probe"],waveform,model_config) if use_probe else wave.new_zeros(());use_content=(step%training.content_every_steps)==0;content=functional.cross_entropy(evaluator(robust_waveform_augmentation(torch,reconstructed)),labels) if use_content else wave.new_zeros(());loss=wave+spectral+training.source_probe_weight*probe+training.frozen_content_weight*content;optimizer.zero_grad(set_to_none=True);loss.backward();torch.nn.utils.clip_grad_norm_(model.parameters(),1.0);optimizer.step();step+=1;total+=float(loss.detach());count+=1
-            if step==1 or step%10==0:elapsed=time.perf_counter()-log_started;print(f"[unified M0] step={step} loss={float(loss.detach()):.4f} spectral={float(spectral.detach()):.4f} frozen_content={float(content.detach()):.4f} source_probe={float(probe.detach()):.4f} seconds_per_10={elapsed/(1 if step==1 else 10):.2f}",flush=True);log_started=time.perf_counter()
+            ticks=ticks.to(device);waveform=ticks.flatten(1);labels=torch.tensor([item["label"] for item in metadata],device=device);reconstructed,_,diagnostics=model(ticks);reconstructed=reconstructed.flatten(1);weight=1+4*waveform.abs().gt(.01);wave=((reconstructed-waveform).abs()*weight).sum()/weight.sum();derivative=functional.l1_loss(reconstructed[:,1:]-reconstructed[:,:-1],waveform[:,1:]-waveform[:,:-1]);spectral=_spectral_loss(torch,reconstructed.float(),waveform.float(),((256,64),(512,128)));sdr=20*torch.tanh(_si_sdr(torch,reconstructed,waveform)/20).mean();auxiliary=step>=training.auxiliary_start_step;use_probe=auxiliary and (step%training.source_probe_every_steps)==0;probe=_source_probe_loss(torch,functional,diagnostics["source_probe"],waveform,model_config) if use_probe else wave.new_zeros(());use_content=auxiliary and (step%training.content_every_steps)==0;content=functional.cross_entropy(evaluator(robust_waveform_augmentation(torch,reconstructed)),labels) if use_content else wave.new_zeros(());loss=training.waveform_weight*wave+training.derivative_weight*derivative+spectral-training.si_sdr_weight*sdr+training.source_probe_weight*probe+training.frozen_content_weight*content;optimizer.zero_grad(set_to_none=True);loss.backward();torch.nn.utils.clip_grad_norm_(model.parameters(),1.0);optimizer.step();step+=1;total+=float(loss.detach());count+=1
+            if step==1 or step%10==0:elapsed=time.perf_counter()-log_started;print(f"[unified M0] step={step} loss={float(loss.detach()):.4f} wave={float(wave.detach()):.4f} spectral={float(spectral.detach()):.4f} si_sdr={float(sdr.detach()):.2f} frozen_content={float(content.detach()):.4f} seconds_per_10={elapsed/(1 if step==1 else 10):.2f}",flush=True);log_started=time.perf_counter()
             if step>=training.max_steps:break
         model.eval();spectral_values=[];shuffled_values=[];mean_values=[];sdr=[];input_separation=[];output_separation=[];real_correct=output_correct=examples=0;example=None
         with torch.no_grad():
