@@ -12,6 +12,9 @@ class ShortMemoryConfig:
     hidden_dim:int=96
     token_layers:int=4
     attention_heads:int=4
+    local_layers:int=2
+    local_kernel:int=7
+    reconstruction_slots:int=4
     output_classes:int=11
 
 def create_short_memory_model(config=ShortMemoryConfig()):
@@ -37,38 +40,55 @@ def create_short_memory_model(config=ShortMemoryConfig()):
             delta=(flat-torch.cat([previous.unsqueeze(-1),flat[:,:,:-1]],-1)).view_as(activity)
             features=torch.cat([activity,delta],1).permute(0,2,1,3).flatten(2);new_state=joined[:,:,-(config.cochlear_kernel-1):],flat[:,:,-1]
             return self.projection(features),new_state
+    class CausalLocalEncoder(nn.Module):
+        """Build phonetic-scale evidence before it is written into long-lived memory."""
+        def __init__(self):
+            super().__init__();self.convolutions=nn.ModuleList([nn.Conv1d(config.hidden_dim,config.hidden_dim,config.local_kernel) for _ in range(config.local_layers)]);self.norms=nn.ModuleList([nn.LayerNorm(config.hidden_dim) for _ in range(config.local_layers)])
+        def initial_state(self,batch,device,dtype):return tuple(torch.zeros(batch,config.hidden_dim,config.local_kernel-1,device=device,dtype=dtype) for _ in self.convolutions)
+        def forward(self,features,state=None):
+            if state is None:state=self.initial_state(len(features),features.device,features.dtype)
+            x=features.transpose(1,2);new_state=[]
+            for convolution,norm,cache in zip(self.convolutions,self.norms,state):
+                joined=torch.cat([cache,x],-1);filtered=convolution(joined).transpose(1,2);x=torch.nn.functional.silu(norm(filtered)+x.transpose(1,2)).transpose(1,2);new_state.append(joined[:,:,-(config.local_kernel-1):])
+            return x.transpose(1,2),tuple(new_state)
     class StreamingShortMemory(nn.Module):
         def __init__(self):
-            super().__init__();self.config=config;self.cochlea=CochlearFrontEnd()
+            super().__init__();self.config=config;self.cochlea=CochlearFrontEnd();self.local_encoder=CausalLocalEncoder()
             self.initial_tokens=nn.Parameter(torch.zeros(config.token_layers,config.hidden_dim));self.level_embedding=nn.Parameter(torch.randn(config.token_layers,config.hidden_dim)*.02)
-            self.token_norm=nn.LayerNorm(config.hidden_dim);self.token_attention=nn.MultiheadAttention(config.hidden_dim,config.attention_heads,batch_first=True)
-            self.update_gate=nn.Linear(config.hidden_dim*3,config.hidden_dim);self.update_candidate=nn.Linear(config.hidden_dim*3,config.hidden_dim)
-            self.refinement=nn.Sequential(nn.LayerNorm(config.hidden_dim),nn.Linear(config.hidden_dim,config.hidden_dim*2),nn.SiLU(),nn.Linear(config.hidden_dim*2,config.hidden_dim))
-            self.read_score=nn.Linear(config.hidden_dim,1);self.output=nn.Linear(config.hidden_dim,config.output_classes);self.content=nn.Linear(config.hidden_dim,10)
-            # Start as slow, nearly identity memory; learning may still open the gate.
-            nn.init.constant_(self.update_gate.bias,-3.0)
-            nn.init.zeros_(self.refinement[-1].weight);nn.init.zeros_(self.refinement[-1].bias)
+            self.token_norms=nn.ModuleList([nn.LayerNorm(config.hidden_dim) for _ in range(config.token_layers)]);self.token_attentions=nn.ModuleList([nn.MultiheadAttention(config.hidden_dim,config.attention_heads,batch_first=True) for _ in range(config.token_layers)])
+            self.update_gates=nn.ModuleList([nn.Linear(config.hidden_dim*4,config.hidden_dim) for _ in range(config.token_layers)]);self.update_candidates=nn.ModuleList([nn.Linear(config.hidden_dim*4,config.hidden_dim) for _ in range(config.token_layers)])
+            self.refinements=nn.ModuleList([nn.Sequential(nn.LayerNorm(config.hidden_dim),nn.Linear(config.hidden_dim,config.hidden_dim*2),nn.SiLU(),nn.Linear(config.hidden_dim*2,config.hidden_dim)) for _ in range(config.token_layers)])
+            self.content_query=nn.Parameter(torch.randn(1,config.hidden_dim)*.02);self.reconstruction_queries=nn.Parameter(torch.randn(config.reconstruction_slots,config.hidden_dim)*.02)
+            self.decoder_attention=nn.MultiheadAttention(config.hidden_dim,config.attention_heads,batch_first=True);self.decoder_norm=nn.LayerNorm(config.hidden_dim);self.decoder_refinement=nn.Sequential(nn.Linear(config.hidden_dim,config.hidden_dim*2),nn.SiLU(),nn.Linear(config.hidden_dim*2,config.hidden_dim))
+            self.content=nn.Linear(config.hidden_dim,10);self.reconstruction=nn.Linear(config.hidden_dim,config.hidden_dim);self.emission=nn.Linear(config.hidden_dim,1)
+            for gate,refinement in zip(self.update_gates,self.refinements):
+                nn.init.constant_(gate.bias,-2.5);nn.init.zeros_(refinement[-1].weight);nn.init.zeros_(refinement[-1].bias)
         def initial_state(self,batch,device=None,dtype=None):
             parameter=next(self.parameters());device=device or parameter.device;dtype=dtype or parameter.dtype
-            tokens=self.initial_tokens.to(device=device,dtype=dtype).unsqueeze(0).expand(batch,-1,-1).clone();return tokens,self.cochlea.initial_state(batch,device,dtype)
+            tokens=self.initial_tokens.to(device=device,dtype=dtype).unsqueeze(0).expand(batch,-1,-1).clone();return tokens,self.cochlea.initial_state(batch,device,dtype),self.local_encoder.initial_state(batch,device,dtype)
         def _update_tokens(self,evidence,tokens):
-            represented=self.token_norm(tokens+self.level_embedding.unsqueeze(0));mask=torch.ones(config.token_layers,config.token_layers,dtype=torch.bool,device=tokens.device).triu(1)
-            context=self.token_attention(represented,represented,represented,attn_mask=mask,need_weights=False)[0]
-            acoustic=evidence.unsqueeze(1).expand(-1,config.token_layers,-1);combined=torch.cat([tokens,context,acoustic+self.level_embedding.unsqueeze(0)],-1)
-            gate=self.update_gate(combined).sigmoid();candidate=self.update_candidate(combined).tanh();tokens=self.token_norm(tokens+gate*(candidate-tokens));return tokens+self.refinement(tokens)
-        def _read(self,tokens):
-            weight=self.read_score(tokens).squeeze(-1).softmax(-1);return (tokens*weight.unsqueeze(-1)).sum(1)
+            old=tokens;updated=[]
+            for level,(norm,attention,gate_layer,candidate_layer,refinement) in enumerate(zip(self.token_norms,self.token_attentions,self.update_gates,self.update_candidates,self.refinements)):
+                query=norm(old[:,level]+self.level_embedding[level]).unsqueeze(1);sources=norm(old[:,:level+1]+self.level_embedding[:level+1].unsqueeze(0));context=attention(query,sources,sources,need_weights=False)[0].squeeze(1)
+                lower=evidence if level==0 else updated[-1];combined=torch.cat([old[:,level],context,lower,evidence],-1);gate=gate_layer(combined).sigmoid();candidate=candidate_layer(combined).tanh();value=old[:,level]+gate*(candidate-old[:,level]);updated.append(value+refinement(value))
+            return torch.stack(updated,1)
+        def decode_memory(self,tokens):
+            queries=torch.cat([self.content_query,self.reconstruction_queries],0).unsqueeze(0).expand(len(tokens),-1,-1);decoded=self.decoder_attention(queries,tokens,tokens,need_weights=False)[0];decoded=self.decoder_norm(queries+decoded);decoded=self.decoder_norm(decoded+self.decoder_refinement(decoded));read=decoded[:,0]
+            return self.content(read),self.reconstruction(decoded[:,1:]),read
+        def _outputs(self,tokens):
+            content,reconstruction,read=self.decode_memory(tokens);emit=self.emission(read).sigmoid().squeeze(-1);digit=content.softmax(-1);probability=torch.cat([(1-emit).unsqueeze(-1),emit.unsqueeze(-1)*digit],-1);logits=probability.clamp_min(1e-7).log()
+            return logits,{"emission_probability":emit,"content_logits":content,"reconstruction":reconstruction}
         def stream_step(self,tick,state=None):
             if tick.ndim!=2 or tick.shape[-1]!=config.tick_samples:raise ValueError(f"expected [batch,{config.tick_samples}] tick")
             if state is None:state=self.initial_state(len(tick),tick.device,tick.dtype)
-            tokens,cochlear_state=state;encoded,cochlear_state=self.cochlea(tick,cochlear_state);tokens=self._update_tokens(encoded[:,0],tokens);value=self._read(tokens);logits=self.output(value);diagnostics={"emission_probability":1-logits.softmax(-1)[:,0],"content_logits":self.content(value),"token_states":tokens};return logits,(tokens,cochlear_state),diagnostics
+            tokens,cochlear_state,local_state=state;encoded,cochlear_state=self.cochlea(tick,cochlear_state);encoded,local_state=self.local_encoder(encoded,local_state);tokens=self._update_tokens(encoded[:,0],tokens);logits,diagnostics=self._outputs(tokens);diagnostics["token_states"]=tokens;diagnostics["encoded_features"]=encoded;return logits,(tokens,cochlear_state,local_state),diagnostics
         def forward(self,ticks,state=None):
             batch,length,samples=ticks.shape
             if state is None:state=self.initial_state(batch,ticks.device,ticks.dtype)
-            tokens,cochlear_state=state;encoded,cochlear_state=self.cochlea(ticks.reshape(batch,length*samples),cochlear_state);logits=[];content=[]
+            tokens,cochlear_state,local_state=state;encoded,cochlear_state=self.cochlea(ticks.reshape(batch,length*samples),cochlear_state);encoded,local_state=self.local_encoder(encoded,local_state);token_history=[]
             for tick in range(length):
-                tokens=self._update_tokens(encoded[:,tick],tokens);value=self._read(tokens);logits.append(self.output(value));content.append(self.content(value))
-            logits=torch.stack(logits,1);diagnostics={"emission_probability":1-logits.softmax(-1)[...,0],"content_logits":torch.stack(content,1),"token_states":tokens};return logits,(tokens,cochlear_state),diagnostics
+                tokens=self._update_tokens(encoded[:,tick],tokens);token_history.append(tokens)
+            token_history=torch.stack(token_history,1);flat=token_history.reshape(batch*length,config.token_layers,config.hidden_dim);flat_logits,flat_diagnostics=self._outputs(flat);logits=flat_logits.view(batch,length,-1);diagnostics={"emission_probability":flat_diagnostics["emission_probability"].view(batch,length),"content_logits":flat_diagnostics["content_logits"].view(batch,length,-1),"token_states":tokens,"token_history":token_history,"encoded_features":encoded};return logits,(tokens,cochlear_state,local_state),diagnostics
         def export_config(self):return asdict(config)
     return StreamingShortMemory()
 
