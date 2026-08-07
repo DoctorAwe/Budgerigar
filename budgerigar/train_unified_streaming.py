@@ -29,7 +29,7 @@ class UnifiedStreamingTrainingConfig:
     latent_contrastive_margin:float=.02
     latent_contrastive_every_steps:int=4
     boundary_weight:float=2.0
-    curvature_weight:float=.5
+    curvature_weight:float=0.0
     seed:int=149
 
 
@@ -56,8 +56,12 @@ def train_unified_streaming(manifest,output_dir,evaluator_checkpoint,training=Un
     torch,_,functional=require_torch();torch.manual_seed(training.seed);random.seed(training.seed);dataset=lambda split,limit:ShortMemoryEpisodeDataset(manifest,split,model_config.sample_rate,model_config.tick_samples,max_records=limit);train=dataset("train",training.max_train_records);validation=dataset("validation",training.max_validation_records);loader=torch.utils.data.DataLoader;train_loader=loader(train,batch_size=training.batch_size,shuffle=True,collate_fn=collate_short_memory);validation_loader=loader(validation,batch_size=training.batch_size,collate_fn=collate_short_memory)
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu");payload=torch.load(evaluator_checkpoint,map_location=device,weights_only=False);evaluator=create_auditory_evaluator(AuditoryEvaluatorConfig(**payload["model_config"])).to(device);evaluator.load_state_dict(payload["model"]);evaluator.eval();evaluator.requires_grad_(False);model=create_unified_streaming_autoencoder(model_config).to(device);optimizer=torch.optim.AdamW(model.parameters(),lr=training.learning_rate,betas=(.8,.99));output_dir=Path(output_dir);output_dir.mkdir(parents=True,exist_ok=True);history=[];best=math.inf;step=0
     if resume_from is not None:
-        resumed=torch.load(resume_from,map_location=device,weights_only=False);current=model.state_dict();compatible={name:value for name,value in resumed["model"].items() if name in current and current[name].shape==value.shape};missing=model.load_state_dict(compatible,strict=False);history=list(resumed.get("history",[]));step=int(history[-1]["step"]) if history else int(resumed.get("step",0));best=min((item["validation_spectral_loss"]+.5*(1-item["validation_frozen_output_digit_accuracy"]) for item in history),default=math.inf)
-        if "optimizer" in resumed and not missing.missing_keys:optimizer.load_state_dict(resumed["optimizer"]);optimizer_source="checkpoint"
+        resumed=torch.load(resume_from,map_location=device,weights_only=False);current=model.state_dict();compatible={name:value for name,value in resumed["model"].items() if name in current and current[name].shape==value.shape}
+        for name in ("local_waveform.2.weight","local_waveform.2.bias","context_waveform.weight","context_waveform.bias"):
+            if name in resumed["model"] and name in current and resumed["model"][name].shape[0]*2==current[name].shape[0]:migrated=current[name].clone();migrated[:resumed["model"][name].shape[0]].copy_(resumed["model"][name]);migrated[resumed["model"][name].shape[0]:].zero_();compatible[name]=migrated
+        missing=model.load_state_dict(compatible,strict=False);history=list(resumed.get("history",[]));step=int(history[-1]["step"]) if history else int(resumed.get("step",0));previous_best=min((item["validation_spectral_loss"]+.5*(1-item["validation_frozen_output_digit_accuracy"]) for item in history),default=math.inf);best=previous_best if (output_dir/"best.pt").is_file() else math.inf
+        exact_model=set(resumed["model"])==set(current) and all(resumed["model"][name].shape==current[name].shape for name in current)
+        if "optimizer" in resumed and exact_model:optimizer.load_state_dict(resumed["optimizer"]);optimizer_source="checkpoint"
         else:optimizer_source="fresh (new or legacy parameters)"
         print(f"[unified resume] step={step} history={len(history)} tensors={len(compatible)} new={len(missing.missing_keys)} optimizer={optimizer_source}",flush=True)
     log_started=time.perf_counter()
