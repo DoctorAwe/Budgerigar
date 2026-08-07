@@ -15,6 +15,9 @@ class ShortMemoryConfig:
     local_layers:int=2
     local_kernel:int=7
     reconstruction_slots:int=4
+    acoustic_slots:int=0
+    acoustic_reconstruction_slots:int=8
+    acoustic_bins:int=32
     output_classes:int=11
 
 def create_short_memory_model(config=ShortMemoryConfig()):
@@ -63,32 +66,56 @@ def create_short_memory_model(config=ShortMemoryConfig()):
             self.content=nn.Linear(config.hidden_dim,10);self.reconstruction=nn.Linear(config.hidden_dim,config.hidden_dim);self.emission=nn.Linear(config.hidden_dim,1)
             for gate,refinement in zip(self.update_gates,self.refinements):
                 nn.init.constant_(gate.bias,-2.5);nn.init.zeros_(refinement[-1].weight);nn.init.zeros_(refinement[-1].bias)
+            self.use_acoustic_memory=config.acoustic_slots>0
+            if self.use_acoustic_memory:
+                self.initial_acoustic=nn.Parameter(torch.zeros(config.acoustic_slots,config.hidden_dim));self.acoustic_embedding=nn.Parameter(torch.randn(config.acoustic_slots,config.hidden_dim)*.02);self.acoustic_norm=nn.LayerNorm(config.hidden_dim);self.acoustic_attention=nn.MultiheadAttention(config.hidden_dim,config.attention_heads,batch_first=True)
+                self.acoustic_gate=nn.Linear(config.hidden_dim*4,config.hidden_dim);self.acoustic_candidate=nn.Linear(config.hidden_dim*4,config.hidden_dim);self.acoustic_refinement=nn.Sequential(nn.LayerNorm(config.hidden_dim),nn.Linear(config.hidden_dim,config.hidden_dim*2),nn.SiLU(),nn.Linear(config.hidden_dim*2,config.hidden_dim));nn.init.constant_(self.acoustic_gate.bias,-2.0);nn.init.zeros_(self.acoustic_refinement[-1].weight);nn.init.zeros_(self.acoustic_refinement[-1].bias)
+                self.acoustic_queries=nn.Parameter(torch.randn(config.acoustic_reconstruction_slots,config.hidden_dim)*.02);self.acoustic_decoder_attention=nn.MultiheadAttention(config.hidden_dim,config.attention_heads,batch_first=True);self.acoustic_decoder_norm=nn.LayerNorm(config.hidden_dim);self.acoustic_decoder_refinement=nn.Sequential(nn.Linear(config.hidden_dim,config.hidden_dim*2),nn.SiLU(),nn.Linear(config.hidden_dim*2,config.hidden_dim));self.acoustic_reconstruction=nn.Linear(config.hidden_dim,config.acoustic_bins)
         def initial_state(self,batch,device=None,dtype=None):
             parameter=next(self.parameters());device=device or parameter.device;dtype=dtype or parameter.dtype
-            tokens=self.initial_tokens.to(device=device,dtype=dtype).unsqueeze(0).expand(batch,-1,-1).clone();return tokens,self.cochlea.initial_state(batch,device,dtype),self.local_encoder.initial_state(batch,device,dtype)
+            tokens=self.initial_tokens.to(device=device,dtype=dtype).unsqueeze(0).expand(batch,-1,-1).clone();base=(tokens,self.cochlea.initial_state(batch,device,dtype),self.local_encoder.initial_state(batch,device,dtype))
+            if not self.use_acoustic_memory:return base
+            acoustic=self.initial_acoustic.to(device=device,dtype=dtype).unsqueeze(0).expand(batch,-1,-1).clone();return tokens,acoustic,base[1],base[2]
         def _update_tokens(self,evidence,tokens):
             old=tokens;updated=[]
             for level,(norm,attention,gate_layer,candidate_layer,refinement) in enumerate(zip(self.token_norms,self.token_attentions,self.update_gates,self.update_candidates,self.refinements)):
                 query=norm(old[:,level]+self.level_embedding[level]).unsqueeze(1);sources=norm(old[:,:level+1]+self.level_embedding[:level+1].unsqueeze(0));context=attention(query,sources,sources,need_weights=False)[0].squeeze(1)
                 lower=evidence if level==0 else updated[-1];combined=torch.cat([old[:,level],context,lower,evidence],-1);gate=gate_layer(combined).sigmoid();candidate=candidate_layer(combined).tanh();value=old[:,level]+gate*(candidate-old[:,level]);updated.append(value+refinement(value))
             return torch.stack(updated,1)
-        def decode_memory(self,tokens):
+        def _update_acoustic(self,evidence,memory):
+            represented=self.acoustic_norm(memory+self.acoustic_embedding.unsqueeze(0));context=self.acoustic_attention(represented,represented,represented,need_weights=False)[0];acoustic=evidence.unsqueeze(1).expand(-1,config.acoustic_slots,-1);embedding=self.acoustic_embedding.unsqueeze(0).expand(len(memory),-1,-1);combined=torch.cat([memory,context,acoustic,embedding],-1);gate=self.acoustic_gate(combined).sigmoid();candidate=self.acoustic_candidate(combined).tanh();value=memory+gate*(candidate-memory);return value+self.acoustic_refinement(value)
+        def decode_memory(self,tokens,acoustic_memory=None):
             queries=torch.cat([self.content_query,self.reconstruction_queries],0).unsqueeze(0).expand(len(tokens),-1,-1);decoded=self.decoder_attention(queries,tokens,tokens,need_weights=False)[0];decoded=self.decoder_norm(queries+decoded);decoded=self.decoder_norm(decoded+self.decoder_refinement(decoded));read=decoded[:,0]
-            return self.content(read),self.reconstruction(decoded[:,1:]),read
-        def _outputs(self,tokens):
-            content,reconstruction,read=self.decode_memory(tokens);emit=self.emission(read).sigmoid().squeeze(-1);digit=content.softmax(-1);probability=torch.cat([(1-emit).unsqueeze(-1),emit.unsqueeze(-1)*digit],-1);logits=probability.clamp_min(1e-7).log()
+            if not self.use_acoustic_memory:return self.content(read),self.reconstruction(decoded[:,1:]),read
+            if acoustic_memory is None:raise ValueError("acoustic_memory is required by this model")
+            acoustic_queries=self.acoustic_queries.unsqueeze(0).expand(len(tokens),-1,-1);acoustic_decoded=self.acoustic_decoder_attention(acoustic_queries,acoustic_memory,acoustic_memory,need_weights=False)[0];acoustic_decoded=self.acoustic_decoder_norm(acoustic_queries+acoustic_decoded);acoustic_decoded=self.acoustic_decoder_norm(acoustic_decoded+self.acoustic_decoder_refinement(acoustic_decoded));return self.content(read),self.acoustic_reconstruction(acoustic_decoded),read
+        def _outputs(self,tokens,acoustic_memory=None):
+            content,reconstruction,read=self.decode_memory(tokens,acoustic_memory);emit=self.emission(read).sigmoid().squeeze(-1);digit=content.softmax(-1);probability=torch.cat([(1-emit).unsqueeze(-1),emit.unsqueeze(-1)*digit],-1);logits=probability.clamp_min(1e-7).log()
             return logits,{"emission_probability":emit,"content_logits":content,"reconstruction":reconstruction}
         def stream_step(self,tick,state=None):
             if tick.ndim!=2 or tick.shape[-1]!=config.tick_samples:raise ValueError(f"expected [batch,{config.tick_samples}] tick")
             if state is None:state=self.initial_state(len(tick),tick.device,tick.dtype)
-            tokens,cochlear_state,local_state=state;encoded,cochlear_state=self.cochlea(tick,cochlear_state);encoded,local_state=self.local_encoder(encoded,local_state);tokens=self._update_tokens(encoded[:,0],tokens);logits,diagnostics=self._outputs(tokens);diagnostics["token_states"]=tokens;diagnostics["encoded_features"]=encoded;return logits,(tokens,cochlear_state,local_state),diagnostics
+            if self.use_acoustic_memory:tokens,acoustic,cochlear_state,local_state=state
+            else:tokens,cochlear_state,local_state=state;acoustic=None
+            encoded,cochlear_state=self.cochlea(tick,cochlear_state);encoded,local_state=self.local_encoder(encoded,local_state);tokens=self._update_tokens(encoded[:,0],tokens)
+            if self.use_acoustic_memory:acoustic=self._update_acoustic(encoded[:,0],acoustic)
+            logits,diagnostics=self._outputs(tokens,acoustic);diagnostics["token_states"]=tokens;diagnostics["encoded_features"]=encoded
+            if self.use_acoustic_memory:diagnostics["acoustic_states"]=acoustic;return logits,(tokens,acoustic,cochlear_state,local_state),diagnostics
+            return logits,(tokens,cochlear_state,local_state),diagnostics
         def forward(self,ticks,state=None):
             batch,length,samples=ticks.shape
             if state is None:state=self.initial_state(batch,ticks.device,ticks.dtype)
-            tokens,cochlear_state,local_state=state;encoded,cochlear_state=self.cochlea(ticks.reshape(batch,length*samples),cochlear_state);encoded,local_state=self.local_encoder(encoded,local_state);token_history=[]
+            if self.use_acoustic_memory:tokens,acoustic,cochlear_state,local_state=state
+            else:tokens,cochlear_state,local_state=state;acoustic=None
+            encoded,cochlear_state=self.cochlea(ticks.reshape(batch,length*samples),cochlear_state);encoded,local_state=self.local_encoder(encoded,local_state);token_history=[];acoustic_history=[]
             for tick in range(length):
                 tokens=self._update_tokens(encoded[:,tick],tokens);token_history.append(tokens)
-            token_history=torch.stack(token_history,1);flat=token_history.reshape(batch*length,config.token_layers,config.hidden_dim);flat_logits,flat_diagnostics=self._outputs(flat);logits=flat_logits.view(batch,length,-1);diagnostics={"emission_probability":flat_diagnostics["emission_probability"].view(batch,length),"content_logits":flat_diagnostics["content_logits"].view(batch,length,-1),"token_states":tokens,"token_history":token_history,"encoded_features":encoded};return logits,(tokens,cochlear_state,local_state),diagnostics
+                if self.use_acoustic_memory:acoustic=self._update_acoustic(encoded[:,tick],acoustic);acoustic_history.append(acoustic)
+            token_history=torch.stack(token_history,1);flat=token_history.reshape(batch*length,config.token_layers,config.hidden_dim);flat_acoustic=None
+            if self.use_acoustic_memory:acoustic_history=torch.stack(acoustic_history,1);flat_acoustic=acoustic_history.reshape(batch*length,config.acoustic_slots,config.hidden_dim)
+            flat_logits,flat_diagnostics=self._outputs(flat,flat_acoustic);logits=flat_logits.view(batch,length,-1);diagnostics={"emission_probability":flat_diagnostics["emission_probability"].view(batch,length),"content_logits":flat_diagnostics["content_logits"].view(batch,length,-1),"token_states":tokens,"token_history":token_history,"encoded_features":encoded}
+            if self.use_acoustic_memory:diagnostics["acoustic_states"]=acoustic;diagnostics["acoustic_history"]=acoustic_history;return logits,(tokens,acoustic,cochlear_state,local_state),diagnostics
+            return logits,(tokens,cochlear_state,local_state),diagnostics
         def export_config(self):return asdict(config)
     return StreamingShortMemory()
 
