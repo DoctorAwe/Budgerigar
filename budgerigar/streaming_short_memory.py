@@ -45,6 +45,9 @@ def create_short_memory_model(config=ShortMemoryConfig()):
             self.update_gate=nn.Linear(config.hidden_dim*3,config.hidden_dim);self.update_candidate=nn.Linear(config.hidden_dim*3,config.hidden_dim)
             self.refinement=nn.Sequential(nn.LayerNorm(config.hidden_dim),nn.Linear(config.hidden_dim,config.hidden_dim*2),nn.SiLU(),nn.Linear(config.hidden_dim*2,config.hidden_dim))
             self.read_score=nn.Linear(config.hidden_dim,1);self.output=nn.Linear(config.hidden_dim,config.output_classes);self.content=nn.Linear(config.hidden_dim,10)
+            # Start as slow, nearly identity memory; learning may still open the gate.
+            nn.init.constant_(self.update_gate.bias,-3.0)
+            nn.init.zeros_(self.refinement[-1].weight);nn.init.zeros_(self.refinement[-1].bias)
         def initial_state(self,batch,device=None,dtype=None):
             parameter=next(self.parameters());device=device or parameter.device;dtype=dtype or parameter.dtype
             tokens=self.initial_tokens.to(device=device,dtype=dtype).unsqueeze(0).expand(batch,-1,-1).clone();return tokens,self.cochlea.initial_state(batch,device,dtype)
