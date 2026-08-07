@@ -8,7 +8,7 @@ class SensorimotorVocoderConfig:
     sample_rate:int=16000
     tick_samples:int=160
     hidden_dim:int=128
-    source_dim:int=8
+    source_dim:int=3
     articulation_dim:int=32
     controller_layers:int=2
 
@@ -25,7 +25,7 @@ def create_sensorimotor_vocoder(config=SensorimotorVocoderConfig()):
         def analyze(self,ticks,state=None):
             encoded=self.hearing(ticks);encoded,state=self.analysis(encoded,state);return self.source_head(encoded),self.articulation_head(encoded).tanh(),state
         def source_parameters(self,source):
-            return {"drive":source[...,0].sigmoid(),"f0_hz":60+340*source[...,1].sigmoid(),"voiced":source[...,2].sigmoid(),"breath":source[...,3].sigmoid()}
+            voiced=source[...,2].sigmoid();return {"drive":source[...,0].sigmoid(),"f0_hz":60+340*source[...,1].sigmoid(),"voiced":voiced,"breath":1-voiced}
         def render(self,source,articulation,state=None,phase=None):
             parameters=self.source_parameters(source);batch,ticks,_=source.shape;phase=torch.zeros(batch,device=source.device,dtype=source.dtype) if phase is None else phase;positions=torch.arange(config.tick_samples,device=source.device,dtype=source.dtype).view(1,1,-1)
             conditioning=torch.cat([self.source_projection(source),self.articulation_projection(articulation),parameters["drive"].unsqueeze(-1)],-1);controlled,state=self.motor_controller(conditioning,state);residual=self.residual(controlled).tanh()
