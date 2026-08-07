@@ -16,6 +16,8 @@ class ShortMemoryTrainingConfig:
     max_validation_records:int=300
     blank_weight:float=.25
     content_weight:float=1.0
+    emission_weight:float=1.0
+    cochlear_learning_rate_scale:float=.1
     seed:int=83
 
 def _masks(torch,metadata,ticks,device):
@@ -32,22 +34,29 @@ def _window_ctc(torch,functional,logits,metadata,device):
         losses.append(functional.ctc_loss(log_probability,target,length,target_length,blank=0,zero_infinity=True))
     return torch.stack(losses).mean()
 
+def _window_emission_loss(torch,functional,probability,metadata):
+    peaks=[]
+    for row,meta in enumerate(metadata):peaks.append(probability[row,meta["window_start_tick"]:meta["window_end_tick"]+1].max())
+    peaks=torch.stack(peaks);return functional.binary_cross_entropy(peaks,torch.ones_like(peaks)),peaks.mean()
+
 def train_short_memory(manifest,output_dir,training=ShortMemoryTrainingConfig(),model_config=ShortMemoryConfig()):
     torch,_,functional=require_torch();torch.manual_seed(training.seed);random.seed(training.seed)
     train=ShortMemoryEpisodeDataset(manifest,"train",model_config.sample_rate,model_config.tick_samples,max_records=training.max_train_records);validation=ShortMemoryEpisodeDataset(manifest,"validation",model_config.sample_rate,model_config.tick_samples,max_records=training.max_validation_records)
     loader=torch.utils.data.DataLoader;train_loader=loader(train,batch_size=training.batch_size,shuffle=True,collate_fn=collate_short_memory);validation_loader=loader(validation,batch_size=training.batch_size,collate_fn=collate_short_memory)
-    device=torch.device("cuda" if torch.cuda.is_available() else "cpu");model=create_short_memory_model(model_config).to(device);optimizer=torch.optim.AdamW(model.parameters(),lr=training.learning_rate)
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu");model=create_short_memory_model(model_config).to(device)
+    filter_parameters=list(model.cochlea.filters.parameters());filter_ids={id(parameter) for parameter in filter_parameters};main_parameters=[parameter for parameter in model.parameters() if id(parameter) not in filter_ids]
+    optimizer=torch.optim.AdamW([{"params":main_parameters,"lr":training.learning_rate},{"params":filter_parameters,"lr":training.learning_rate*training.cochlear_learning_rate_scale}])
     output_dir=Path(output_dir);output_dir.mkdir(parents=True,exist_ok=True);history=[];best=-1.;step=0
     for epoch in range(training.epochs):
         model.train();total=count=0
         for samples,_,valid,metadata in train_loader:
             samples,valid=samples.to(device),valid.to(device);logits,_,diagnostics=model(samples);early,hold,late,labels=_masks(torch,metadata,samples.shape[1],device);early&=valid;hold&=valid;late&=valid
-            expanded=labels.unsqueeze(1).expand_as(hold);content_loss=functional.cross_entropy(diagnostics["content_logits"][hold],expanded[hold]);ctc=_window_ctc(torch,functional,logits,metadata,device)
-            blank_mask=(early|late)&valid;blank_loss=functional.cross_entropy(logits[blank_mask],torch.zeros(int(blank_mask.sum()),dtype=torch.long,device=device));loss=ctc+training.content_weight*content_loss+training.blank_weight*blank_loss
+            expanded=labels.unsqueeze(1).expand_as(hold);content_loss=functional.cross_entropy(diagnostics["content_logits"][hold],expanded[hold]);ctc=_window_ctc(torch,functional,logits,metadata,device);emission_loss,peak=_window_emission_loss(torch,functional,diagnostics["emission_probability"],metadata)
+            blank_mask=(early|late)&valid;blank_loss=functional.cross_entropy(logits[blank_mask],torch.zeros(int(blank_mask.sum()),dtype=torch.long,device=device));loss=ctc+training.content_weight*content_loss+training.blank_weight*blank_loss+training.emission_weight*emission_loss
             optimizer.zero_grad(set_to_none=True);loss.backward();torch.nn.utils.clip_grad_norm_(model.parameters(),1.0);optimizer.step();step+=1;total+=float(loss.detach());count+=1
-            if step==1 or step%10==0:print(f"[short memory] step={step} loss={float(loss):.4f} ctc={float(ctc):.4f} content={float(content_loss):.4f} blank={float(blank_loss):.4f}",flush=True)
+            if step==1 or step%10==0:print(f"[short memory] step={step} loss={float(loss):.4f} ctc={float(ctc):.4f} content={float(content_loss):.4f} blank={float(blank_loss):.4f} emit={float(emission_loss):.4f} peak={float(peak):.3f}",flush=True)
             if step>=training.max_steps:break
-        model.eval();memory_correct=emission_correct=emitted=examples=early_count=within=0;latencies=[];stream_match=[]
+        model.eval();memory_correct=emission_correct=emitted=examples=early_count=within=0;latencies=[];stream_match=[];window_peaks=[]
         with torch.no_grad():
             for samples,_,valid,metadata in validation_loader:
                 samples,valid=samples.to(device),valid.to(device);logits,_,diagnostics=model(samples);chosen=logits.argmax(-1)
@@ -56,12 +65,12 @@ def train_short_memory(manifest,output_dir,training=ShortMemoryTrainingConfig(),
                 stream_match.append(float(torch.stack(parts,1).sub(logits).abs().max()))
                 for row,meta in enumerate(metadata):
                     examples+=1;start,end=meta["window_start_tick"],meta["window_end_tick"];label=meta["label"]
-                    memory_prediction=int(diagnostics["content_logits"][row,start:end+1].mean(0).argmax());memory_correct+=int(memory_prediction==label)
+                    memory_prediction=int(diagnostics["content_logits"][row,start:end+1].mean(0).argmax());memory_correct+=int(memory_prediction==label);window_peaks.append(float(diagnostics["emission_probability"][row,start:end+1].max()))
                     positions=torch.nonzero(chosen[row].gt(0)&valid[row]).flatten();early_count+=int(bool((positions<start).any()));window=positions[(positions>=start)&(positions<=end)]
                     if len(window):
                         emitted+=1;within+=1;first=int(window[0]);emission_correct+=int(int(chosen[row,first])-1==label);latencies.append((first-meta["audio_end_tick"])*1000*model_config.tick_samples/model_config.sample_rate)
-        metrics={"epoch":epoch+1,"step":step,"train_loss":total/max(count,1),"validation_memory_digit_accuracy":memory_correct/max(examples,1),"validation_window_emission_accuracy":emission_correct/max(examples,1),"validation_emission_recall":emitted/max(examples,1),"validation_early_emission_rate":early_count/max(examples,1),"validation_mean_latency_ms":sum(latencies)/max(len(latencies),1),"streaming_max_logit_difference":max(stream_match)};history.append(metrics);print(json.dumps(metrics),flush=True)
-        architecture=f"streaming_cochlear_{model_config.token_layers}token_memory_window_ctc";score=metrics["validation_window_emission_accuracy"]-metrics["validation_early_emission_rate"];checkpoint={"architecture":architecture,"model":model.state_dict(),"model_config":asdict(model_config),"training_config":asdict(training),"history":history};torch.save(checkpoint,output_dir/"last.pt")
+        metrics={"epoch":epoch+1,"step":step,"train_loss":total/max(count,1),"validation_memory_digit_accuracy":memory_correct/max(examples,1),"validation_window_emission_accuracy":emission_correct/max(examples,1),"validation_emission_recall":emitted/max(examples,1),"validation_early_emission_rate":early_count/max(examples,1),"validation_mean_latency_ms":sum(latencies)/max(len(latencies),1),"validation_window_peak_probability":sum(window_peaks)/len(window_peaks),"streaming_max_logit_difference":max(stream_match)};history.append(metrics);print(json.dumps(metrics),flush=True)
+        architecture=f"streaming_cochlear_{model_config.token_layers}token_memory_window_ctc_emission";score=metrics["validation_window_emission_accuracy"]-metrics["validation_early_emission_rate"];checkpoint={"architecture":architecture,"model":model.state_dict(),"model_config":asdict(model_config),"training_config":asdict(training),"history":history};torch.save(checkpoint,output_dir/"last.pt")
         if score>best:best=score;torch.save(checkpoint,output_dir/"best.pt")
         if step>=training.max_steps:break
-    report={"architecture":f"streaming_cochlear_{model_config.token_layers}token_memory_window_ctc","steps":step,"best_score":best,"history":history};(output_dir/"training_report.json").write_text(json.dumps(report,indent=2),encoding="utf-8");return report
+    report={"architecture":f"streaming_cochlear_{model_config.token_layers}token_memory_window_ctc_emission","steps":step,"best_score":best,"history":history};(output_dir/"training_report.json").write_text(json.dumps(report,indent=2),encoding="utf-8");return report
