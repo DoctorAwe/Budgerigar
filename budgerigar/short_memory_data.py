@@ -13,7 +13,7 @@ def _balanced_limit(rows,limit):
 
 class ShortMemoryEpisodeDataset:
     """A spoken digit followed by silence and one delayed output-token event."""
-    def __init__(self,manifest,split,sample_rate=16000,tick_samples=80,thinking_ms=(120,280),max_records=None,preload=True):
+    def __init__(self,manifest,split,sample_rate=16000,tick_samples=160,thinking_ms=(120,280),max_records=None,preload=True):
         self.manifest=Path(manifest);self.sample_rate=sample_rate;self.tick_samples=tick_samples;self.thinking_ms=thinking_ms
         rows=[json.loads(x) for x in self.manifest.read_text(encoding="utf-8").splitlines() if x.strip()]
         self.rows=_balanced_limit([row for row in rows if row["split"]==split],max_records);self.cache={}
@@ -36,7 +36,7 @@ class ShortMemoryEpisodeDataset:
         audio=torch.nn.functional.pad(waveform,(leading,0));audio_ticks=(len(audio)+self.tick_samples-1)//self.tick_samples
         audio=torch.nn.functional.pad(audio,(0,audio_ticks*self.tick_samples-len(audio)))
         digest=int.from_bytes(hashlib.sha256(row["id"].encode()).digest()[:4],"big")
-        low=self.thinking_ms[0]//5;high=self.thinking_ms[1]//5;thinking=low+digest%(high-low+1)
+        tick_ms=1000*self.tick_samples/self.sample_rate;low=round(self.thinking_ms[0]/tick_ms);high=round(self.thinking_ms[1]/tick_ms);thinking=low+digest%(high-low+1)
         emission_tick=audio_ticks+thinking;total_ticks=emission_tick+4
         samples=torch.nn.functional.pad(audio,(0,(total_ticks-audio_ticks)*self.tick_samples)).view(total_ticks,self.tick_samples)
         targets=torch.zeros(total_ticks,dtype=torch.long);targets[emission_tick]=int(row["label"])+1

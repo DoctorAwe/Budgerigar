@@ -19,11 +19,10 @@ class ShortMemoryTrainingConfig:
 
 def train_short_memory(manifest,output_dir,training=ShortMemoryTrainingConfig(),model_config=ShortMemoryConfig()):
     torch,_,functional=require_torch();torch.manual_seed(training.seed);random.seed(training.seed)
-    train=ShortMemoryEpisodeDataset(manifest,"train",max_records=training.max_train_records);validation=ShortMemoryEpisodeDataset(manifest,"validation",max_records=training.max_validation_records)
+    train=ShortMemoryEpisodeDataset(manifest,"train",model_config.sample_rate,model_config.tick_samples,max_records=training.max_train_records);validation=ShortMemoryEpisodeDataset(manifest,"validation",model_config.sample_rate,model_config.tick_samples,max_records=training.max_validation_records)
     loader=torch.utils.data.DataLoader;train_loader=loader(train,batch_size=training.batch_size,shuffle=True,collate_fn=collate_short_memory);validation_loader=loader(validation,batch_size=training.batch_size,collate_fn=collate_short_memory)
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu");model=create_short_memory_model(model_config).to(device)
-    # Initialize LazyLinear before constructing optimizer.
-    model(torch.zeros(1,1,model_config.tick_samples,device=device));optimizer=torch.optim.AdamW(model.parameters(),lr=training.learning_rate);output_dir=Path(output_dir);output_dir.mkdir(parents=True,exist_ok=True);history=[];best=-1.;step=0
+    optimizer=torch.optim.AdamW(model.parameters(),lr=training.learning_rate);output_dir=Path(output_dir);output_dir.mkdir(parents=True,exist_ok=True);history=[];best=-1.;step=0
     for epoch in range(training.epochs):
         model.train();total=count=0
         for samples,targets,valid,_ in train_loader:
@@ -46,8 +45,8 @@ def train_short_memory(manifest,output_dir,training=ShortMemoryTrainingConfig(),
                     after=positions[positions>end]
                     if len(after):
                         emitted+=1;first=int(after[0]);correct+=int(int(chosen[row,first])-1==meta["label"]);onset.append(abs(first-meta["emission_tick"]))
-        metrics={"epoch":epoch+1,"step":step,"train_loss":total/max(count,1),"validation_token_accuracy":correct/max(emitted,1),"validation_emission_recall":emitted/max(examples,1),"validation_early_emission_rate":early/max(examples,1),"validation_onset_mae_ms":(sum(onset)/max(len(onset),1))*5,"streaming_max_logit_difference":max(stream_match)};history.append(metrics);print(json.dumps(metrics),flush=True)
-        score=metrics["validation_token_accuracy"]*metrics["validation_emission_recall"]-metrics["validation_early_emission_rate"];checkpoint={"architecture":"streaming_short_memory_token","model":model.state_dict(),"model_config":asdict(model_config),"training_config":asdict(training),"history":history};torch.save(checkpoint,output_dir/"last.pt")
+        tick_ms=1000*model_config.tick_samples/model_config.sample_rate;metrics={"epoch":epoch+1,"step":step,"train_loss":total/max(count,1),"validation_token_accuracy":correct/max(emitted,1),"validation_emission_recall":emitted/max(examples,1),"validation_early_emission_rate":early/max(examples,1),"validation_onset_mae_ms":(sum(onset)/max(len(onset),1))*tick_ms,"streaming_max_logit_difference":max(stream_match)};history.append(metrics);print(json.dumps(metrics),flush=True)
+        score=metrics["validation_token_accuracy"]*metrics["validation_emission_recall"]-metrics["validation_early_emission_rate"];checkpoint={"architecture":"streaming_cochlear_short_memory_token","model":model.state_dict(),"model_config":asdict(model_config),"training_config":asdict(training),"history":history};torch.save(checkpoint,output_dir/"last.pt")
         if score>best:best=score;torch.save(checkpoint,output_dir/"best.pt")
         if step>=training.max_steps:break
-    report={"architecture":"streaming_short_memory_token","steps":step,"best_score":best,"history":history};(output_dir/"training_report.json").write_text(json.dumps(report,indent=2),encoding="utf-8");return report
+    report={"architecture":"streaming_cochlear_short_memory_token","steps":step,"best_score":best,"history":history};(output_dir/"training_report.json").write_text(json.dumps(report,indent=2),encoding="utf-8");return report
