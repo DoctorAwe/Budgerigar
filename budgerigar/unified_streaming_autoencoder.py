@@ -1,0 +1,36 @@
+from __future__ import annotations
+from dataclasses import asdict,dataclass
+from .neural_echo import require_torch
+
+
+@dataclass(frozen=True)
+class UnifiedStreamingConfig:
+    sample_rate:int=16000
+    tick_samples:int=160
+    subframes:int=4
+    hidden_dim:int=128
+    latent_dim:int=32
+    recurrent_layers:int=2
+
+
+def create_unified_streaming_autoencoder(config=UnifiedStreamingConfig()):
+    torch,nn,_=require_torch()
+    if config.tick_samples%config.subframes:raise ValueError("tick_samples must divide evenly into subframes")
+    subframe_samples=config.tick_samples//config.subframes
+    class UnifiedStreamingAutoencoder(nn.Module):
+        def __init__(self):
+            super().__init__();self.config=config
+            self.hearing=nn.Sequential(nn.Linear(subframe_samples,config.hidden_dim),nn.LayerNorm(config.hidden_dim),nn.SiLU());self.encoder=nn.GRU(config.hidden_dim,config.hidden_dim,num_layers=config.recurrent_layers,batch_first=True);self.latent=nn.Sequential(nn.Linear(config.hidden_dim,config.latent_dim),nn.Tanh());self.latent_projection=nn.Sequential(nn.Linear(config.latent_dim,config.hidden_dim),nn.LayerNorm(config.hidden_dim),nn.SiLU());self.decoder=nn.GRU(config.hidden_dim,config.hidden_dim,num_layers=config.recurrent_layers,batch_first=True);self.waveform=nn.Linear(config.hidden_dim,subframe_samples);self.source_probe=nn.Linear(config.hidden_dim,3)
+        def encode(self,ticks,state=None):
+            batch,length,samples=ticks.shape;subframes=ticks.view(batch,length*config.subframes,subframe_samples);encoded,state=self.encoder(self.hearing(subframes),state);latent=self.latent(encoded);return latent,state,encoded
+        def decode(self,latent,state=None):
+            decoded,state=self.decoder(self.latent_projection(latent),state);waveform=self.waveform(decoded).tanh();batch=latent.shape[0];return waveform.reshape(batch,-1,config.tick_samples),state
+        def probe_source(self,encoded):
+            batch,subframes,_=encoded.shape;pooled=encoded.view(batch,-1,config.subframes,config.hidden_dim).mean(2);raw=self.source_probe(pooled);voiced=raw[...,2].sigmoid();return {"drive":raw[...,0].sigmoid(),"f0_hz":60+340*raw[...,1].sigmoid(),"voiced":voiced}
+        def stream_step(self,tick,state=None):
+            if tick.ndim!=2 or tick.shape[-1]!=config.tick_samples:raise ValueError(f"expected [batch,{config.tick_samples}]")
+            encoder_state,decoder_state=(None,None) if state is None else state;latent,encoder_state,encoded=self.encode(tick.unsqueeze(1),encoder_state);waveform,decoder_state=self.decode(latent,decoder_state);diagnostics={"latent":latent,"source_probe":self.probe_source(encoded)};return waveform[:,0],(encoder_state,decoder_state),diagnostics
+        def forward(self,ticks,state=None):
+            encoder_state,decoder_state=(None,None) if state is None else state;latent,encoder_state,encoded=self.encode(ticks,encoder_state);waveform,decoder_state=self.decode(latent,decoder_state);return waveform,(encoder_state,decoder_state),{"latent":latent,"source_probe":self.probe_source(encoded)}
+        def export_config(self):return asdict(config)
+    return UnifiedStreamingAutoencoder()
