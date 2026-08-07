@@ -9,8 +9,9 @@ class ShortMemoryConfig:
     cochlear_bands:int=32
     cochlear_kernel:int=129
     subframes:int=4
-    hidden_dim:int=160
-    recurrent_layers:int=3
+    hidden_dim:int=96
+    token_layers:int=16
+    attention_heads:int=4
     output_classes:int=11
 
 def create_short_memory_model(config=ShortMemoryConfig()):
@@ -38,18 +39,33 @@ def create_short_memory_model(config=ShortMemoryConfig()):
             return self.projection(features),new_state
     class StreamingShortMemory(nn.Module):
         def __init__(self):
-            super().__init__();self.config=config;self.cochlea=CochlearFrontEnd();self.memory=nn.GRU(config.hidden_dim,config.hidden_dim,num_layers=config.recurrent_layers,batch_first=True);self.norm=nn.LayerNorm(config.hidden_dim);self.output=nn.Linear(config.hidden_dim,config.output_classes)
+            super().__init__();self.config=config;self.cochlea=CochlearFrontEnd()
+            self.initial_tokens=nn.Parameter(torch.zeros(config.token_layers,config.hidden_dim));self.level_embedding=nn.Parameter(torch.randn(config.token_layers,config.hidden_dim)*.02)
+            self.token_norm=nn.LayerNorm(config.hidden_dim);self.token_attention=nn.MultiheadAttention(config.hidden_dim,config.attention_heads,batch_first=True)
+            self.update_gate=nn.Linear(config.hidden_dim*3,config.hidden_dim);self.update_candidate=nn.Linear(config.hidden_dim*3,config.hidden_dim)
+            self.refinement=nn.Sequential(nn.LayerNorm(config.hidden_dim),nn.Linear(config.hidden_dim,config.hidden_dim*2),nn.SiLU(),nn.Linear(config.hidden_dim*2,config.hidden_dim))
+            self.read_score=nn.Linear(config.hidden_dim,1);self.output=nn.Linear(config.hidden_dim,config.output_classes);self.content=nn.Linear(config.hidden_dim,10)
         def initial_state(self,batch,device=None,dtype=None):
             parameter=next(self.parameters());device=device or parameter.device;dtype=dtype or parameter.dtype
-            return torch.zeros(config.recurrent_layers,batch,config.hidden_dim,device=device,dtype=dtype),self.cochlea.initial_state(batch,device,dtype)
+            tokens=self.initial_tokens.to(device=device,dtype=dtype).unsqueeze(0).expand(batch,-1,-1).clone();return tokens,self.cochlea.initial_state(batch,device,dtype)
+        def _update_tokens(self,evidence,tokens):
+            represented=self.token_norm(tokens+self.level_embedding.unsqueeze(0));mask=torch.ones(config.token_layers,config.token_layers,dtype=torch.bool,device=tokens.device).triu(1)
+            context=self.token_attention(represented,represented,represented,attn_mask=mask,need_weights=False)[0]
+            acoustic=evidence.unsqueeze(1).expand(-1,config.token_layers,-1);combined=torch.cat([tokens,context,acoustic+self.level_embedding.unsqueeze(0)],-1)
+            gate=self.update_gate(combined).sigmoid();candidate=self.update_candidate(combined).tanh();tokens=self.token_norm(tokens+gate*(candidate-tokens));return tokens+self.refinement(tokens)
+        def _read(self,tokens):
+            weight=self.read_score(tokens).squeeze(-1).softmax(-1);return (tokens*weight.unsqueeze(-1)).sum(1)
         def stream_step(self,tick,state=None):
             if tick.ndim!=2 or tick.shape[-1]!=config.tick_samples:raise ValueError(f"expected [batch,{config.tick_samples}] tick")
             if state is None:state=self.initial_state(len(tick),tick.device,tick.dtype)
-            memory_state,cochlear_state=state;encoded,cochlear_state=self.cochlea(tick,cochlear_state);value,memory_state=self.memory(encoded,memory_state);logits=self.output(self.norm(value[:,0]));return logits,(memory_state,cochlear_state),1-logits.softmax(-1)[:,0]
+            tokens,cochlear_state=state;encoded,cochlear_state=self.cochlea(tick,cochlear_state);tokens=self._update_tokens(encoded[:,0],tokens);value=self._read(tokens);logits=self.output(value);diagnostics={"emission_probability":1-logits.softmax(-1)[:,0],"content_logits":self.content(value),"token_states":tokens};return logits,(tokens,cochlear_state),diagnostics
         def forward(self,ticks,state=None):
             batch,length,samples=ticks.shape
             if state is None:state=self.initial_state(batch,ticks.device,ticks.dtype)
-            memory_state,cochlear_state=state;encoded,cochlear_state=self.cochlea(ticks.reshape(batch,length*samples),cochlear_state);value,memory_state=self.memory(encoded,memory_state);logits=self.output(self.norm(value));return logits,(memory_state,cochlear_state),1-logits.softmax(-1)[...,0]
+            tokens,cochlear_state=state;encoded,cochlear_state=self.cochlea(ticks.reshape(batch,length*samples),cochlear_state);logits=[];content=[]
+            for tick in range(length):
+                tokens=self._update_tokens(encoded[:,tick],tokens);value=self._read(tokens);logits.append(self.output(value));content.append(self.content(value))
+            logits=torch.stack(logits,1);diagnostics={"emission_probability":1-logits.softmax(-1)[...,0],"content_logits":torch.stack(content,1),"token_states":tokens};return logits,(tokens,cochlear_state),diagnostics
         def export_config(self):return asdict(config)
     return StreamingShortMemory()
 
