@@ -11,10 +11,10 @@ def _load_checkpoint(torch,path,device):
 
 
 def render_short_memory_audition(manifest,checkpoint_path,output_dir,index=0,split="validation"):
-    """Render a stereo, full-timeline audit: input left and emitted token tones right.
+    """Render aligned mono input and token-output timelines as separate files.
 
-    The right channel is deliberately a sonification of token output, not synthesized
-    speech. A silent right channel means that the model emitted no non-blank token.
+    The output is deliberately a sonification of token events, not synthesized speech.
+    A silent output file means that the model emitted no non-blank token.
     """
     torch,_,_=require_torch();device=torch.device("cuda" if torch.cuda.is_available() else "cpu");checkpoint=_load_checkpoint(torch,checkpoint_path,device)
     config=ShortMemoryConfig(**checkpoint["model_config"]);model=create_short_memory_model(config).to(device);model.load_state_dict(checkpoint["model"]);model.eval()
@@ -29,8 +29,8 @@ def render_short_memory_audition(manifest,checkpoint_path,output_dir,index=0,spl
     for run in runs:
         start=run["start_tick"]*config.tick_samples;duration=max(minimum_tone,(run["end_tick"]-run["start_tick"]+1)*config.tick_samples);end=min(start+duration,total);frequency=300.0+70.0*run["digit"]
         output_audio[start:end]=.18*torch.sin(2*torch.pi*frequency*sample_positions[start:end]/config.sample_rate)
-    stereo=torch.stack([input_audio,output_audio]);output_dir=Path(output_dir);output_dir.mkdir(parents=True,exist_ok=True);path=output_dir/f"{metadata['id']}.input_left_token_right.wav"
+    output_dir=Path(output_dir);output_dir.mkdir(parents=True,exist_ok=True);input_path=output_dir/f"{metadata['id']}.input.wav";output_path=output_dir/f"{metadata['id']}.output_token.wav"
     import torchaudio
-    torchaudio.save(str(path),stereo,config.sample_rate)
+    torchaudio.save(str(input_path),input_audio.unsqueeze(0),config.sample_rate);torchaudio.save(str(output_path),output_audio.unsqueeze(0),config.sample_rate)
     end_tick=metadata["audio_end_tick"];delay_tick=metadata["window_end_tick"]
-    return {"path":str(path),"id":metadata["id"],"target_digit":metadata["label"],"predicted_at_audio_end":int(content[end_tick].argmax()),"predicted_after_delay":int(content[delay_tick].argmax()),"audio_end_ms":(end_tick+1)*config.tick_samples*1000/config.sample_rate,"allowed_window_ms":[metadata["window_start_tick"]*config.tick_samples*1000/config.sample_rate,(metadata["window_end_tick"]+1)*config.tick_samples*1000/config.sample_rate],"peak_emission_probability":float(emission.max()),"emitted_runs":runs,"sonification_minimum_duration_ms":120,"channel_layout":"left=input waveform; right=model token sonification (digit frequencies 300+70*d Hz)"}
+    return {"input_path":str(input_path),"output_path":str(output_path),"id":metadata["id"],"target_digit":metadata["label"],"predicted_at_audio_end":int(content[end_tick].argmax()),"predicted_after_delay":int(content[delay_tick].argmax()),"audio_end_ms":(end_tick+1)*config.tick_samples*1000/config.sample_rate,"allowed_window_ms":[metadata["window_start_tick"]*config.tick_samples*1000/config.sample_rate,(metadata["window_end_tick"]+1)*config.tick_samples*1000/config.sample_rate],"timeline_duration_ms":total*1000/config.sample_rate,"peak_emission_probability":float(emission.max()),"emitted_runs":runs,"sonification_minimum_duration_ms":120,"layout":"separate aligned mono files; output is token sonification (digit frequencies 300+70*d Hz)"}
