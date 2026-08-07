@@ -22,6 +22,7 @@ class HumanSpeechTrainingConfig:
     control_weight:float=1.0
     envelope_weight:float=.5
     waveform_weight:float=.05
+    spectral_balance_weight:float=.5
     seed:int=163
 
 
@@ -37,7 +38,11 @@ def _source_targets(torch,functional,waveform,config):
 
 
 def _control_loss(torch,functional,controls,waveform,config):
-    energy,pitch,voiced=_source_targets(torch,functional,waveform,config);predicted_pitch=(controls["f0_hz"]-60)/340;pitch_error=functional.smooth_l1_loss(predicted_pitch,pitch,reduction="none");pitch_error=(pitch_error*voiced).sum()/voiced.sum().clamp_min(1);active=energy.gt(.01).float();aperiodic=functional.binary_cross_entropy(controls["aperiodicity"],1-voiced,reduction="none");aperiodic=(aperiodic*active).sum()/active.sum().clamp_min(1);return functional.l1_loss(controls["pressure"],energy)+2*pitch_error+functional.binary_cross_entropy(controls["voiced"],voiced)+.5*aperiodic
+    energy,pitch,voiced=_source_targets(torch,functional,waveform,config);target_hz=60+340*pitch;pitch_error=functional.smooth_l1_loss(controls["f0_hz"]/100,target_hz/100,reduction="none");pitch_error=(pitch_error*voiced).sum()/voiced.sum().clamp_min(1);active=energy.gt(.01).float();aperiodic=functional.binary_cross_entropy(controls["aperiodicity"],1-voiced,reduction="none");aperiodic=(aperiodic*active).sum()/active.sum().clamp_min(1);return functional.l1_loss(controls["pressure"],energy)+2*pitch_error+functional.binary_cross_entropy(controls["voiced"],voiced)+.5*aperiodic
+
+
+def _spectral_balance_loss(torch,predicted,target,sample_rate):
+    window=torch.hann_window(512,device=target.device,dtype=target.dtype);estimate=torch.stft(predicted,n_fft=512,hop_length=128,window=window,return_complex=True).abs().mean(-1);truth=torch.stft(target,n_fft=512,hop_length=128,window=window,return_complex=True).abs().mean(-1);estimate_distribution=estimate/estimate.sum(-1,keepdim=True).clamp_min(1e-6);truth_distribution=truth/truth.sum(-1,keepdim=True).clamp_min(1e-6);frequencies=torch.fft.rfftfreq(512,1/sample_rate).to(target);estimate_centroid=(estimate_distribution*frequencies).sum(-1);truth_centroid=(truth_distribution*frequencies).sum(-1);high=frequencies>2000;estimate_high=estimate_distribution[:,high].sum(-1);truth_high=truth_distribution[:,high].sum(-1);shape=(estimate_distribution-truth_distribution).abs().sum(-1);centroid=(estimate_centroid.clamp_min(1).log()-truth_centroid.clamp_min(1).log()).abs();high_error=(estimate_high.clamp_min(1e-5).log()-truth_high.clamp_min(1e-5).log()).abs();return (shape+.5*centroid+.25*high_error).mean()
 
 
 def _energy_envelope(torch,waveform,config):
@@ -58,8 +63,8 @@ def train_human_speech(manifest,output_dir,evaluator_checkpoint,training=HumanSp
     for epoch in range(training.epochs):
         model.train();total=count=0
         for ticks,_,_,metadata in train_loader:
-            ticks=ticks.to(device);target=ticks.flatten(1);labels=torch.tensor([item["label"] for item in metadata],device=device);output,_,diagnostics=model(ticks);output=output.flatten(1);acoustic=_acoustic_loss(torch,output.float(),target.float());target_energy=_energy_envelope(torch,target,model_config);output_energy=_energy_envelope(torch,output,model_config);envelope=functional.l1_loss(output_energy,target_energy);control=_control_loss(torch,functional,diagnostics["controls"],target,model_config);content=functional.cross_entropy(evaluator(robust_waveform_augmentation(torch,output)),labels);waveform=functional.l1_loss(output,target);loss=training.acoustic_weight*acoustic+training.envelope_weight*envelope+training.control_weight*control+training.content_weight*content+training.waveform_weight*waveform;optimizer.zero_grad(set_to_none=True);loss.backward();torch.nn.utils.clip_grad_norm_(model.parameters(),1.0);optimizer.step();step+=1;total+=float(loss.detach());count+=1
-            if step==1 or step%10==0:elapsed=time.perf_counter()-started;print(f"[human speech M0] step={step} loss={float(loss.detach()):.4f} acoustic={float(acoustic.detach()):.4f} envelope={float(envelope.detach()):.4f} control={float(control.detach()):.4f} content={float(content.detach()):.4f} sec/10={elapsed/(1 if step==1 else 10):.2f}",flush=True);started=time.perf_counter()
+            ticks=ticks.to(device);target=ticks.flatten(1);labels=torch.tensor([item["label"] for item in metadata],device=device);output,_,diagnostics=model(ticks);output=output.flatten(1);acoustic=_acoustic_loss(torch,output.float(),target.float());target_energy=_energy_envelope(torch,target,model_config);output_energy=_energy_envelope(torch,output,model_config);envelope=functional.l1_loss(output_energy,target_energy);control=_control_loss(torch,functional,diagnostics["controls"],target,model_config);spectral_balance=_spectral_balance_loss(torch,output.float(),target.float(),model_config.sample_rate);content=functional.cross_entropy(evaluator(robust_waveform_augmentation(torch,output)),labels);waveform=functional.l1_loss(output,target);loss=training.acoustic_weight*acoustic+training.envelope_weight*envelope+training.control_weight*control+training.spectral_balance_weight*spectral_balance+training.content_weight*content+training.waveform_weight*waveform;optimizer.zero_grad(set_to_none=True);loss.backward();torch.nn.utils.clip_grad_norm_(model.parameters(),1.0);optimizer.step();step+=1;total+=float(loss.detach());count+=1
+            if step==1 or step%10==0:elapsed=time.perf_counter()-started;print(f"[human speech M0] step={step} loss={float(loss.detach()):.4f} acoustic={float(acoustic.detach()):.4f} balance={float(spectral_balance.detach()):.4f} control={float(control.detach()):.4f} content={float(content.detach()):.4f} sec/10={elapsed/(1 if step==1 else 10):.2f}",flush=True);started=time.perf_counter()
             if step>=training.max_steps:break
         model.eval();correct=[];shuffled=[];mean_values=[];energy_errors=[];duration_ratios=[];f0_errors=[];predicted_f0=[];target_f0=[];centroid_ratios=[];high_frequency_ratios=[];real_correct=output_correct=examples=0;input_separation=[];output_separation=[];example=None
         with torch.no_grad():

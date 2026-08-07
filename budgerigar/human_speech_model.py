@@ -15,6 +15,8 @@ class HumanSpeechConfig:
     recurrent_layers:int=2
     synthesis_frame_samples:int=160
     harmonics:int=16
+    minimum_f0_hz:float=70.0
+    maximum_f0_hz:float=260.0
 
 
 def create_human_speech_model(config=HumanSpeechConfig()):
@@ -35,7 +37,7 @@ def create_human_speech_model(config=HumanSpeechConfig()):
             else:cache,previous,context_state=state
             waveform=ticks.flatten(1);joined=torch.cat([cache,waveform.unsqueeze(1)],-1);response=self.cochlea(joined).abs().clamp_min(1e-6).pow(.3);steps=length*config.subframes;activity=response.view(batch,config.cochlear_bands,steps,hop).mean(-1);delta=activity-torch.cat([previous.unsqueeze(-1),activity[:,:,:-1]],-1);features=torch.cat([activity,delta],1).transpose(1,2);represented,context_state=self.auditory_context(self.auditory_projection(features),context_state);latent=self.sensation(represented);state=(joined[:,:,-(config.cochlear_kernel-1):],activity[:,:,-1],context_state);return latent,state
         def _controls(self,motor):
-            raw=self.larynx(motor);voiced=raw[...,2].sigmoid();return {"pressure":raw[...,0].sigmoid(),"f0_hz":60+340*raw[...,1].sigmoid(),"voiced":voiced,"aperiodicity":raw[...,3].sigmoid()}
+            raw=self.larynx(motor);voiced=raw[...,2].sigmoid();return {"pressure":raw[...,0].sigmoid(),"f0_hz":config.minimum_f0_hz+(config.maximum_f0_hz-config.minimum_f0_hz)*raw[...,1].sigmoid(),"voiced":voiced,"aperiodicity":raw[...,3].sigmoid()}
         def synthesize(self,latent,state=None,phase=None):
             batch,steps,_=latent.shape
             if state is None:motor_state=None;overlap=latent.new_zeros(batch,config.synthesis_frame_samples-hop)
