@@ -57,7 +57,7 @@ class ShortMemoryEpisodeDataset:
         window_start=audio_ticks+low;window_end=audio_ticks+high;total_ticks=window_end+4
         samples=torch.nn.functional.pad(audio,(0,(total_ticks-audio_ticks)*self.tick_samples)).view(total_ticks,self.tick_samples)
         targets=torch.zeros(total_ticks,dtype=torch.long)
-        return samples,targets,{"id":row["id"],"label":int(row["label"]),"audio_end_tick":audio_ticks-1,"window_start_tick":window_start,"window_end_tick":window_end}
+        return samples,targets,{"id":row["id"],"label":int(row["label"]),"audio_start_tick":leading//self.tick_samples,"audio_end_tick":audio_ticks-1,"window_start_tick":window_start,"window_end_tick":window_end}
 
 def collate_short_memory(batch):
     torch,_,_=require_torch();ticks=max(len(x[0]) for x in batch);samples=torch.zeros(len(batch),ticks,batch[0][0].shape[-1]);targets=torch.zeros(len(batch),ticks,dtype=torch.long);valid=torch.zeros(len(batch),ticks,dtype=torch.bool)
