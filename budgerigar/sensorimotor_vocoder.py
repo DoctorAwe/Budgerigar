@@ -20,7 +20,6 @@ def create_sensorimotor_vocoder(config=SensorimotorVocoderConfig()):
             super().__init__();self.config=config
             self.hearing=nn.Sequential(nn.Linear(config.tick_samples,config.hidden_dim),nn.LayerNorm(config.hidden_dim),nn.SiLU());self.analysis=nn.GRU(config.hidden_dim,config.hidden_dim,num_layers=2,batch_first=True)
             self.source_head=nn.Linear(config.hidden_dim,config.source_dim);self.articulation_head=nn.Linear(config.hidden_dim,config.articulation_dim)
-            self.content_head=nn.Sequential(nn.LayerNorm(config.articulation_dim),nn.Linear(config.articulation_dim,10))
             self.articulation_projection=nn.Sequential(nn.Linear(config.articulation_dim,config.hidden_dim),nn.LayerNorm(config.hidden_dim),nn.SiLU())
             self.motor_controller=nn.GRU(config.hidden_dim,config.hidden_dim,num_layers=config.controller_layers,batch_first=True);self.residual=nn.Linear(config.hidden_dim,config.tick_samples)
         def analyze(self,ticks,state=None):
