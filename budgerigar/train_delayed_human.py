@@ -25,7 +25,11 @@ def train_delayed_human(manifest,output_dir,human_checkpoint,semantic_checkpoint
     torch,_,functional=require_torch();torch.manual_seed(training.seed);random.seed(training.seed);make=lambda split,limit:DelayedRepeatDataset(manifest,split,model_config.human.sample_rate,model_config.human.tick_samples,training.thinking_ms,max_records=limit);train=make("train",training.max_train_records);validation=make("validation",training.max_validation_records);loader=torch.utils.data.DataLoader;train_loader=loader(train,batch_size=training.batch_size,shuffle=True,collate_fn=collate_delayed_repeat);validation_loader=loader(validation,batch_size=training.batch_size,collate_fn=collate_delayed_repeat)
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu");base=torch.load(human_checkpoint,map_location=device,weights_only=False);memory=torch.load(semantic_checkpoint,map_location=device,weights_only=False);model=create_delayed_human_speech(model_config).to(device);model.human.load_state_dict(base["model"]);model.semantic.load_state_dict(memory["model"]);model.human.requires_grad_(False);model.semantic.requires_grad_(False);model.human.eval();model.semantic.eval();evaluation=torch.load(evaluator_checkpoint,map_location=device,weights_only=False);evaluator=create_auditory_evaluator(AuditoryEvaluatorConfig(**evaluation["model_config"])).to(device);evaluator.load_state_dict(evaluation["model"]);evaluator.eval();evaluator.requires_grad_(False);parameters=[value for value in model.parameters() if value.requires_grad];optimizer=torch.optim.AdamW(parameters,lr=training.learning_rate,betas=(.8,.99));output_dir=Path(output_dir);output_dir.mkdir(parents=True,exist_ok=True);history=[];best=math.inf;step=0;started=time.perf_counter()
     for epoch in range(training.epochs):
-        model.train();model.human.eval();model.semantic.eval();total=count=0
+        # Gradients must pass through the frozen motor GRU into recall_projection.
+        # cuDNN forbids RNN backward after an eval-mode forward, so keep the
+        # frozen human module in training execution mode; requires_grad remains
+        # False and this architecture contains no dropout or batch norm.
+        model.train();model.human.train();model.semantic.eval();total=count=0
         for inputs,targets,_,metadata in train_loader:
             inputs=inputs.to(device);targets=targets.to(device);outputs,_,diagnostics=model(inputs);losses=[]
             for row,item in enumerate(metadata):
