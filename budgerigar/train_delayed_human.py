@@ -15,6 +15,7 @@ class DelayedHumanTrainingConfig:
     learning_rate:float=3e-4
     semantic_learning_rate_scale:float=.1
     max_steps:int=500
+    semantic_warmup_steps:int=250
     epochs:int=30
     max_train_records:int=1000
     max_validation_records:int=100
@@ -36,11 +37,16 @@ def train_delayed_human(manifest,output_dir,human_checkpoint,semantic_checkpoint
         # False and this architecture contains no dropout or batch norm.
         model.train();model.human.train();model.semantic.eval();total=count=0
         for inputs,targets,_,metadata in train_loader:
-            inputs=inputs.to(device);targets=targets.to(device);outputs,_,diagnostics=model(inputs);losses=[]
+            inputs=inputs.to(device);targets=targets.to(device);warmup=step<training.semantic_warmup_steps
+            if warmup:_,_,diagnostics=model.remember(inputs);outputs=None
+            else:outputs,_,diagnostics=model(inputs)
+            losses=[]
             for row,item in enumerate(metadata):
-                start=item["repeat_start"];end=item["total_ticks"];predicted=outputs[row,start:end].flatten();target=targets[row,start:end].flatten();early=outputs[row,:start].square().mean().sqrt();acoustic=_acoustic_loss(torch,predicted.float(),target.float());target_features=functional.normalize(evaluator.features(target.unsqueeze(0)).detach(),dim=-1);output_features=functional.normalize(evaluator.features(predicted.unsqueeze(0)),dim=-1);perceptual=1-(output_features*target_features).sum(-1).mean();label=torch.tensor([item["label"]],device=device);content=functional.cross_entropy(evaluator(predicted.unsqueeze(0)),label);semantic_end=functional.cross_entropy(diagnostics["content_logits"][row,item["source_ticks"]-1].unsqueeze(0),label);semantic_delay=functional.cross_entropy(diagnostics["content_logits"][row,start-1].unsqueeze(0),label);losses.append(acoustic+.5*perceptual+.25*content+.25*(semantic_end+semantic_delay)+2*early)
+                start=item["repeat_start"];label=torch.tensor([item["label"]],device=device);semantic_end=functional.cross_entropy(diagnostics["content_logits"][row,item["source_ticks"]-1].unsqueeze(0),label);semantic_delay=functional.cross_entropy(diagnostics["content_logits"][row,start-1].unsqueeze(0),label);semantic_loss=.5*(semantic_end+semantic_delay)
+                if warmup:losses.append(semantic_loss);continue
+                end=item["total_ticks"];predicted=outputs[row,start:end].flatten();target=targets[row,start:end].flatten();early=outputs[row,:start].square().mean().sqrt();early_peak=outputs[row,:start].square().mean(-1).sqrt().max();acoustic=_acoustic_loss(torch,predicted.float(),target.float());target_features=functional.normalize(evaluator.features(target.unsqueeze(0)).detach(),dim=-1);output_features=functional.normalize(evaluator.features(predicted.unsqueeze(0)),dim=-1);perceptual=1-(output_features*target_features).sum(-1).mean();content=functional.cross_entropy(evaluator(predicted.unsqueeze(0)),label);losses.append(acoustic+.5*perceptual+.25*content+.5*semantic_loss+5*early+2*early_peak)
             loss=torch.stack(losses).mean();optimizer.zero_grad(set_to_none=True);loss.backward();torch.nn.utils.clip_grad_norm_(parameters,1);optimizer.step();step+=1;total+=float(loss.detach());count+=1
-            if step==1 or step%10==0:elapsed=time.perf_counter()-started;print(f"[delayed human] step={step} loss={float(loss.detach()):.4f} sec/10={elapsed/(1 if step==1 else 10):.2f}",flush=True);started=time.perf_counter()
+            if step==1 or step%10==0:elapsed=time.perf_counter()-started;print(f"[delayed human] phase={'semantic' if warmup else 'waveform'} step={step} loss={float(loss.detach()):.4f} sec/10={elapsed/(1 if step==1 else 10):.2f}",flush=True);started=time.perf_counter()
             if step>=training.max_steps:break
         model.eval();acoustic_values=[];early_values=[];correct=semantic_end_correct=semantic_delay_correct=semantic_cleared_correct=examples=0;onset_errors=[];example=None
         with torch.no_grad():
